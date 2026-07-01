@@ -4,6 +4,7 @@ import curses
 import datetime
 import enum
 import html.parser
+import locale
 import os
 import re
 import sys
@@ -495,3 +496,32 @@ class BrowserApp:
         shown_status = _truncate(status, width - 1)
         self.stdscr.addstr(height - 1, 0, shown_status, curses.A_DIM)
         self.stdscr.refresh()
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    # Must run before curses.wrapper()/initscr() so the window's encoding
+    # resolves to the process locale (needed for the Chinese UI text to render).
+    locale.setlocale(locale.LC_ALL, "")
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    os.makedirs(args.output_dir, exist_ok=True)
+    error_holder: List[str] = []
+
+    def _run(stdscr):
+        app = BrowserApp(stdscr, args.url, args.output_dir)
+        if app.stack is None:
+            error_holder.append(app.status)
+            return
+        app.run()
+
+    try:
+        curses.wrapper(_run)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+    if error_holder:
+        print(error_holder[0], file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
