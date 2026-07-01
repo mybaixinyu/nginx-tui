@@ -56,6 +56,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         raise SystemExit(0)
     args = parser.parse_args(argv)
     args.url = normalize_url(args.url)
+    args.output_dir = os.path.expanduser(args.output_dir)
     return args
 
 
@@ -395,6 +396,8 @@ class BrowserApp:
             if key == -1:
                 continue
             if key == curses.KEY_RESIZE:
+                if self.stack is not None:
+                    self._adjust_offset()
                 continue
             if self.stack is None:
                 if resolve_action(key) == Action.QUIT:
@@ -533,7 +536,10 @@ class BrowserApp:
         self._set_status(f"{os.path.basename(dest_path)} 已存在，是否覆盖？(y/n)")
         self._draw()
         while True:
-            key = self.stdscr.getch()
+            try:
+                key = self.stdscr.getch()
+            except KeyboardInterrupt:
+                return False
             if key == -1:
                 continue
             return key in (ord("y"), ord("Y"))
@@ -541,6 +547,14 @@ class BrowserApp:
     def _draw(self) -> None:
         self.stdscr.erase()
         height, width = self.stdscr.getmaxyx()
+        try:
+            self._draw_unsafe(height, width)
+        except curses.error:
+            # A single bad boundary write (resize race, narrow width, quirky
+            # terminfo) shouldn't crash the app — skip this frame and retry.
+            pass
+
+    def _draw_unsafe(self, height: int, width: int) -> None:
         if height < 4 or width < 20:
             message = _truncate("终端窗口太小", max(width - 1, 0))
             self.stdscr.addstr(0, 0, message)
@@ -599,7 +613,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     # resolves to the process locale (needed for the Chinese UI text to render).
     locale.setlocale(locale.LC_ALL, "")
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    os.makedirs(args.output_dir, exist_ok=True)
+    try:
+        os.makedirs(args.output_dir, exist_ok=True)
+    except OSError as exc:
+        print(f"无法创建输出目录 {args.output_dir}：{exc}", file=sys.stderr)
+        sys.exit(1)
     error_holder: List[str] = []
 
     def _run(stdscr):

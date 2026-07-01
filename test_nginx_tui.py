@@ -9,7 +9,7 @@ import threading
 import unittest
 import unittest.mock
 import urllib.error
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 from nginx_tui import (
     Action,
@@ -22,6 +22,7 @@ from nginx_tui import (
     format_mtime,
     format_row,
     format_size,
+    main,
     normalize_url,
     parse_args,
     parse_index,
@@ -69,6 +70,11 @@ class TestParseArgs(unittest.TestCase):
     def test_output_dir_flag_is_honored(self):
         args = parse_args(["http://example.com/files/", "--output-dir", "/tmp/dl"])
         self.assertEqual(args.output_dir, "/tmp/dl")
+
+    def test_output_dir_expands_tilde(self):
+        with unittest.mock.patch.dict(os.environ, {"HOME": "/tmp/fake-home"}):
+            args = parse_args(["http://example.com/files/", "--output-dir", "~/dl"])
+        self.assertEqual(args.output_dir, "/tmp/fake-home/dl")
 
 
 SAMPLE_INDEX_HTML = (
@@ -316,6 +322,74 @@ class TestRefreshCurrent(unittest.TestCase):
         self.assertEqual(parse_mock.call_args.args[1], "http://x/")
         self.assertEqual(app.stack.current.entries, refreshed_entries)
         self.assertEqual(app.stack.current.selected, 0)
+
+
+class TestConfirmOverwrite(unittest.TestCase):
+    def test_keyboard_interrupt_cancels_instead_of_propagating(self):
+        class _InterruptingStdScr(_FakeStdScr):
+            def getch(self):
+                raise KeyboardInterrupt
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            app.stdscr = _InterruptingStdScr()
+            result = app._confirm_overwrite("/tmp/dl/existing.txt")
+        self.assertFalse(result)
+
+
+class TestDrawResilience(unittest.TestCase):
+    def test_curses_error_during_draw_does_not_propagate(self):
+        class _FailingStdScr(_FakeStdScr):
+            def addstr(self, *args, **kwargs):
+                raise curses.error("boundary write failed")
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FailingStdScr(), "http://x/", "/tmp")
+            app._draw()  # must not raise curses.error
+
+
+class TestResizeAdjustsOffset(unittest.TestCase):
+    def test_resize_key_triggers_offset_adjustment(self):
+        class _ResizeThenQuitStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = 0
+
+            def getch(self):
+                self.calls += 1
+                return curses.KEY_RESIZE if self.calls == 1 else ord("q")
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            app.stdscr = _ResizeThenQuitStdScr()
+            with unittest.mock.patch.object(app, "_adjust_offset") as adjust_mock:
+                app.run()
+        adjust_mock.assert_called_once()
+
+
+class TestMain(unittest.TestCase):
+    def test_output_dir_creation_failure_exits_cleanly(self):
+        with unittest.mock.patch("nginx_tui.locale.setlocale"), \
+            unittest.mock.patch("nginx_tui.os.makedirs", side_effect=OSError("Permission denied")), \
+            unittest.mock.patch("nginx_tui.curses.wrapper") as wrapper_mock:
+            err = io.StringIO()
+            with redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    main(["http://example.com/files/", "--output-dir", "/no/permission"])
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("无法创建输出目录", err.getvalue())
+        wrapper_mock.assert_not_called()
 
 
 class TestResolveAction(unittest.TestCase):
