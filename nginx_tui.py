@@ -197,3 +197,34 @@ def download_file(
         if os.path.exists(part_path):
             os.remove(part_path)
         raise
+
+
+@dataclass
+class Frame:
+    url: str
+    entries: List[Entry]
+    selected: int = 0
+    offset: int = 0
+
+
+class NavigationStack:
+    """Back-navigation via a cached frame stack — popping never re-fetches."""
+
+    def __init__(self, initial_url: str, initial_entries: List[Entry]) -> None:
+        self._frames: List[Frame] = [Frame(url=initial_url, entries=initial_entries)]
+
+    @property
+    def current(self) -> Frame:
+        return self._frames[-1]
+
+    def push(self, url: str, entries: List[Entry]) -> None:
+        self._frames.append(Frame(url=url, entries=entries))
+
+    def pop(self) -> bool:
+        if len(self._frames) <= 1:
+            return False
+        self._frames.pop()
+        return True
+
+    def at_root(self) -> bool:
+        return len(self._frames) <= 1

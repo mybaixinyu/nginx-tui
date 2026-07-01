@@ -10,7 +10,7 @@ import unittest.mock
 import urllib.error
 from contextlib import redirect_stdout
 
-from nginx_tui import normalize_url, parse_args, Entry, format_mtime, format_size, parse_index, download_file, fetch_index
+from nginx_tui import normalize_url, parse_args, Entry, format_mtime, format_size, parse_index, download_file, fetch_index, NavigationStack
 
 
 class TestNormalizeUrl(unittest.TestCase):
@@ -214,6 +214,44 @@ class TestDownloadFile(_ServerTestCase):
         with self.assertRaises(urllib.error.HTTPError):
             download_file(self.base_url + "missing.bin", dest_path)
         self.assertFalse(os.path.exists(dest_path + ".part"))
+
+
+def _make_entry(name):
+    return Entry(name=name, href=name, url="http://x/" + name, is_dir=False, size_bytes=1, mtime=None)
+
+
+class TestNavigationStack(unittest.TestCase):
+    def test_starts_with_initial_frame(self):
+        entries = [_make_entry("a.txt")]
+        stack = NavigationStack("http://x/", entries)
+        self.assertEqual(stack.current.url, "http://x/")
+        self.assertEqual(stack.current.entries, entries)
+        self.assertTrue(stack.at_root())
+
+    def test_push_moves_current_to_new_frame(self):
+        stack = NavigationStack("http://x/", [])
+        sub_entries = [_make_entry("b.txt")]
+        stack.push("http://x/sub/", sub_entries)
+        self.assertEqual(stack.current.url, "http://x/sub/")
+        self.assertEqual(stack.current.entries, sub_entries)
+        self.assertFalse(stack.at_root())
+
+    def test_pop_restores_previous_frame_with_cached_state(self):
+        stack = NavigationStack("http://x/", [])
+        stack.current.selected = 3
+        stack.current.offset = 1
+        stack.push("http://x/sub/", [_make_entry("b.txt")])
+        popped = stack.pop()
+        self.assertTrue(popped)
+        self.assertEqual(stack.current.url, "http://x/")
+        self.assertEqual(stack.current.selected, 3)
+        self.assertEqual(stack.current.offset, 1)
+
+    def test_pop_at_root_is_noop(self):
+        stack = NavigationStack("http://x/", [])
+        popped = stack.pop()
+        self.assertFalse(popped)
+        self.assertTrue(stack.at_root())
 
 
 if __name__ == "__main__":
