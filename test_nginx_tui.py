@@ -340,6 +340,21 @@ class TestConfirmOverwrite(unittest.TestCase):
             result = app._confirm_overwrite("/tmp/dl/existing.txt")
         self.assertFalse(result)
 
+    def test_escape_key_cancels_like_n(self):
+        class _EscStdScr(_FakeStdScr):
+            def getch(self):
+                return 27
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            app.stdscr = _EscStdScr()
+            result = app._confirm_overwrite("/tmp/dl/existing.txt")
+        self.assertFalse(result)
+
 
 class TestDrawResilience(unittest.TestCase):
     def test_curses_error_during_draw_does_not_propagate(self):
@@ -419,6 +434,7 @@ class TestResolveAction(unittest.TestCase):
         self.assertEqual(resolve_action(127), Action.BACK)
         self.assertEqual(resolve_action(curses.KEY_LEFT), Action.BACK)
         self.assertEqual(resolve_action(ord("u")), Action.BACK)
+        self.assertEqual(resolve_action(27), Action.BACK)
 
     def test_q_quits(self):
         self.assertEqual(resolve_action(ord("q")), Action.QUIT)

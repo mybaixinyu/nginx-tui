@@ -288,6 +288,7 @@ _KEY_ACTIONS = {
     127: Action.BACK,
     curses.KEY_LEFT: Action.BACK,
     ord("u"): Action.BACK,
+    27: Action.BACK,  # Esc; unrelated to _confirm_overwrite, which has its own y/n getch loop
     ord("q"): Action.QUIT,
     ord("Q"): Action.QUIT,
 }
@@ -588,7 +589,7 @@ class BrowserApp:
                 attr |= self.dir_attr
             self.stdscr.addstr(y, 0, line, attr)
 
-        status = "↑/↓ 移动   Enter/点击 进入或下载   r 刷新   Backspace 返回上级   q 退出"
+        status = "↑/↓ 移动   Enter/点击 进入或下载   r 刷新   Backspace/Esc 返回上级   q 退出"
         shown_status = _truncate(status, width - 1)
         self.stdscr.addstr(height - 1, 0, shown_status, curses.A_DIM)
         if self._status_visible():
