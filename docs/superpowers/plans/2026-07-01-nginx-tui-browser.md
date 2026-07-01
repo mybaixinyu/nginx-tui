@@ -56,6 +56,12 @@ class TestNormalizeUrl(unittest.TestCase):
     def test_keeps_https_scheme(self):
         self.assertEqual(normalize_url("https://example.com/files/"), "https://example.com/files/")
 
+    def test_adds_http_scheme_to_hostname_with_port(self):
+        self.assertEqual(normalize_url("localhost:8000/files/"), "http://localhost:8000/files/")
+
+    def test_adds_http_scheme_to_ip_with_port(self):
+        self.assertEqual(normalize_url("127.0.0.1:8080"), "http://127.0.0.1:8080")
+
 
 class TestParseArgs(unittest.TestCase):
     def test_no_args_prints_help_and_exits_zero(self):
@@ -114,10 +120,15 @@ PROGRESS_THROTTLE_SECONDS = 0.1
 _USER_AGENT = "nginx-tui/1.0"
 
 
+_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+
+
 def normalize_url(raw_url: str) -> str:
-    if not urllib.parse.urlparse(raw_url).scheme:
-        return "http://" + raw_url
-    return raw_url
+    # urlparse().scheme misparses "localhost:8000/x" as scheme="localhost";
+    # requiring "://" right after the scheme name avoids that false positive.
+    if _SCHEME_RE.match(raw_url):
+        return raw_url
+    return "http://" + raw_url
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -147,7 +158,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python3 -m unittest test_nginx_tui -v`
-Expected: 7 tests, all PASS.
+Expected: 9 tests, all PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -379,7 +390,7 @@ def parse_index(html_text: str, base_url: str) -> List[Entry]:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python3 -m unittest test_nginx_tui -v`
-Expected: all tests PASS (20 total so far).
+Expected: all tests PASS (22 total so far).
 
 - [ ] **Step 5: Commit**
 
@@ -551,7 +562,7 @@ def download_file(
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python3 -m unittest test_nginx_tui -v`
-Expected: all tests PASS (26 total so far).
+Expected: all tests PASS (28 total so far).
 
 - [ ] **Step 5: Commit**
 
@@ -662,7 +673,7 @@ class NavigationStack:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python3 -m unittest test_nginx_tui -v`
-Expected: all tests PASS (30 total so far).
+Expected: all tests PASS (32 total so far).
 
 - [ ] **Step 5: Commit**
 
@@ -826,7 +837,7 @@ def format_row(entry: Entry, name_width: int) -> str:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python3 -m unittest test_nginx_tui -v`
-Expected: all tests PASS (40 total so far).
+Expected: all tests PASS (42 total so far).
 
 - [ ] **Step 5: Commit**
 
@@ -1050,7 +1061,7 @@ class BrowserApp:
 - [ ] **Step 2: Run the existing automated test suite to confirm no regressions**
 
 Run: `python3 -m unittest test_nginx_tui -v`
-Expected: all 40 tests still PASS (this task added no new automated tests, so the count doesn't change).
+Expected: all 42 tests still PASS (this task added no new automated tests, so the count doesn't change).
 
 - [ ] **Step 3: Manually verify against a local nginx instance**
 
@@ -1111,6 +1122,9 @@ git commit -m "feat: add interactive curses browser and download flow"
 
 ```python
 def main(argv: Optional[List[str]] = None) -> None:
+    # Must run before curses.wrapper()/initscr() so the window's encoding
+    # resolves to the process locale (needed for the Chinese UI text to render).
+    locale.setlocale(locale.LC_ALL, "")
     args = parse_args(sys.argv[1:] if argv is None else argv)
     os.makedirs(args.output_dir, exist_ok=True)
     error_holder: List[str] = []
@@ -1139,7 +1153,7 @@ if __name__ == "__main__":
 - [ ] **Step 2: Run the full automated test suite**
 
 Run: `python3 -m unittest test_nginx_tui -v`
-Expected: all 40 tests PASS.
+Expected: all 42 tests PASS.
 
 - [ ] **Step 3: Make the script executable**
 
