@@ -11,7 +11,22 @@ import unittest.mock
 import urllib.error
 from contextlib import redirect_stdout
 
-from nginx_tui import normalize_url, parse_args, Entry, format_mtime, format_size, parse_index, download_file, fetch_index, NavigationStack, Action, _display_width, format_row, resolve_action
+from nginx_tui import (
+    Action,
+    BrowserApp,
+    Entry,
+    NavigationStack,
+    _display_width,
+    download_file,
+    fetch_index,
+    format_mtime,
+    format_row,
+    format_size,
+    normalize_url,
+    parse_args,
+    parse_index,
+    resolve_action,
+)
 
 
 class TestNormalizeUrl(unittest.TestCase):
@@ -23,6 +38,9 @@ class TestNormalizeUrl(unittest.TestCase):
 
     def test_keeps_https_scheme(self):
         self.assertEqual(normalize_url("https://example.com/files/"), "https://example.com/files/")
+
+    def test_strips_outer_whitespace(self):
+        self.assertEqual(normalize_url("  http://example.com/files/  "), "http://example.com/files/")
 
     def test_adds_http_scheme_to_hostname_with_port(self):
         self.assertEqual(normalize_url("localhost:8000/files/"), "http://localhost:8000/files/")
@@ -87,6 +105,9 @@ class TestFormatMtime(unittest.TestCase):
 
     def test_parses_nginx_date_format(self):
         self.assertEqual(format_mtime("06-Jul-2023 10:00"), "2023-07-06 10:00")
+
+    def test_parses_nginx_date_format_independent_of_locale(self):
+        self.assertEqual(format_mtime("01-Jul-2026 17:50"), "2026-07-01 17:50")
 
     def test_unparseable_falls_back_to_raw(self):
         self.assertEqual(format_mtime("not-a-date"), "not-a-date")
@@ -255,6 +276,48 @@ class TestNavigationStack(unittest.TestCase):
         self.assertTrue(stack.at_root())
 
 
+class _FakeStdScr:
+    def erase(self):
+        pass
+
+    def getmaxyx(self):
+        return (24, 100)
+
+    def addstr(self, *args, **kwargs):
+        pass
+
+    def refresh(self):
+        pass
+
+    def keypad(self, *args, **kwargs):
+        pass
+
+    def timeout(self, *args, **kwargs):
+        pass
+
+    def getch(self):
+        return ord("q")
+
+
+class TestRefreshCurrent(unittest.TestCase):
+    def test_refresh_reloads_current_directory(self):
+        initial_entries = [Entry("old.txt", "old.txt", "http://x/old.txt", False, 1, None)]
+        refreshed_entries = [Entry("new.txt", "new.txt", "http://x/new.txt", False, 2, None)]
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>") as fetch_mock, \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=refreshed_entries) as parse_mock:
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            app.stack.current.entries = initial_entries
+            app.stack.current.selected = 0
+            app._refresh_current()
+        self.assertEqual(fetch_mock.call_args.args[0], "http://x/")
+        self.assertEqual(parse_mock.call_args.args[1], "http://x/")
+        self.assertEqual(app.stack.current.entries, refreshed_entries)
+        self.assertEqual(app.stack.current.selected, 0)
+
+
 class TestResolveAction(unittest.TestCase):
     def test_up_arrow_and_k_move_up(self):
         self.assertEqual(resolve_action(curses.KEY_UP), Action.MOVE_UP)
@@ -267,6 +330,10 @@ class TestResolveAction(unittest.TestCase):
     def test_page_up_and_down(self):
         self.assertEqual(resolve_action(curses.KEY_PPAGE), Action.PAGE_UP)
         self.assertEqual(resolve_action(curses.KEY_NPAGE), Action.PAGE_DOWN)
+
+    def test_refresh_key_maps_to_refresh(self):
+        self.assertEqual(resolve_action(ord("r")), Action.REFRESH)
+        self.assertEqual(resolve_action(ord("R")), Action.REFRESH)
 
     def test_enter_variants_activate(self):
         self.assertEqual(resolve_action(10), Action.ACTIVATE)
