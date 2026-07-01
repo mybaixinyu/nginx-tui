@@ -161,3 +161,39 @@ def parse_index(html_text: str, base_url: str) -> List[Entry]:
             mtime=format_mtime(date_raw),
         ))
     return entries
+
+
+def fetch_index(url: str, timeout: float = CONNECT_TIMEOUT) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        return response.read().decode(charset, errors="replace")
+
+
+def download_file(
+    url: str,
+    dest_path: str,
+    progress_cb: Optional[Callable[[int, Optional[int]], None]] = None,
+    timeout: float = CONNECT_TIMEOUT,
+) -> None:
+    part_path = dest_path + ".part"
+    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            total_header = response.headers.get("Content-Length")
+            total_bytes = int(total_header) if total_header is not None else None
+            downloaded = 0
+            with open(part_path, "wb") as out_file:
+                while True:
+                    chunk = response.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    out_file.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_cb is not None:
+                        progress_cb(downloaded, total_bytes)
+        os.replace(part_path, dest_path)
+    except BaseException:
+        if os.path.exists(part_path):
+            os.remove(part_path)
+        raise

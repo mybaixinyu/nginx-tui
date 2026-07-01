@@ -1,9 +1,16 @@
-import os
+import functools
+import http.server
 import io
+import os
+import shutil
+import tempfile
+import threading
 import unittest
+import unittest.mock
+import urllib.error
 from contextlib import redirect_stdout
 
-from nginx_tui import normalize_url, parse_args, Entry, format_mtime, format_size, parse_index
+from nginx_tui import normalize_url, parse_args, Entry, format_mtime, format_size, parse_index, download_file, fetch_index
 
 
 class TestNormalizeUrl(unittest.TestCase):
@@ -122,6 +129,91 @@ class TestParseIndex(unittest.TestCase):
         self.assertEqual(weird.name, "weird.bin")
         self.assertIsNone(weird.size_bytes)
         self.assertIsNone(weird.mtime)
+
+
+class _QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+
+class _ServerTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.serve_dir = tempfile.mkdtemp()
+        handler = functools.partial(_QuietHandler, directory=cls.serve_dir)
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        cls.base_url = f"http://127.0.0.1:{cls.server.server_port}/"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.serve_dir, ignore_errors=True)
+
+
+class TestFetchIndex(_ServerTestCase):
+    def test_fetches_and_decodes_text(self):
+        with open(os.path.join(self.serve_dir, "page.html"), "w", encoding="utf-8") as f:
+            f.write("<html>你好</html>")
+        result = fetch_index(self.base_url + "page.html")
+        self.assertEqual(result, "<html>你好</html>")
+
+    def test_raises_on_404(self):
+        with self.assertRaises(urllib.error.HTTPError):
+            fetch_index(self.base_url + "missing.html")
+
+
+class TestDownloadFile(_ServerTestCase):
+    def setUp(self):
+        self.dest_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dest_dir, ignore_errors=True)
+
+    def test_downloads_file_content_exactly(self):
+        content = os.urandom(5000)
+        with open(os.path.join(self.serve_dir, "blob.bin"), "wb") as f:
+            f.write(content)
+        dest_path = os.path.join(self.dest_dir, "blob.bin")
+        download_file(self.base_url + "blob.bin", dest_path)
+        with open(dest_path, "rb") as f:
+            self.assertEqual(f.read(), content)
+        self.assertFalse(os.path.exists(dest_path + ".part"))
+
+    def test_reports_progress_in_chunks(self):
+        content = os.urandom(5000)
+        with open(os.path.join(self.serve_dir, "blob2.bin"), "wb") as f:
+            f.write(content)
+        dest_path = os.path.join(self.dest_dir, "blob2.bin")
+        progress_calls = []
+        with unittest.mock.patch("nginx_tui.CHUNK_SIZE", 1024):
+            download_file(
+                self.base_url + "blob2.bin", dest_path,
+                progress_cb=lambda downloaded, total: progress_calls.append((downloaded, total)),
+            )
+        self.assertGreaterEqual(len(progress_calls), 5)
+        self.assertEqual(progress_calls[-1], (5000, 5000))
+
+    def test_cleans_up_partial_file_on_progress_callback_error(self):
+        content = os.urandom(5000)
+        with open(os.path.join(self.serve_dir, "blob3.bin"), "wb") as f:
+            f.write(content)
+        dest_path = os.path.join(self.dest_dir, "blob3.bin")
+
+        def failing_progress(downloaded, total):
+            raise KeyboardInterrupt()
+
+        with unittest.mock.patch("nginx_tui.CHUNK_SIZE", 1024):
+            with self.assertRaises(KeyboardInterrupt):
+                download_file(self.base_url + "blob3.bin", dest_path, progress_cb=failing_progress)
+        self.assertFalse(os.path.exists(dest_path))
+        self.assertFalse(os.path.exists(dest_path + ".part"))
+
+    def test_raises_and_leaves_no_partial_file_on_404(self):
+        dest_path = os.path.join(self.dest_dir, "missing.bin")
+        with self.assertRaises(urllib.error.HTTPError):
+            download_file(self.base_url + "missing.bin", dest_path)
+        self.assertFalse(os.path.exists(dest_path + ".part"))
 
 
 if __name__ == "__main__":
