@@ -338,6 +338,10 @@ class BrowserApp:
             key = self.stdscr.getch()
             if key == curses.KEY_RESIZE:
                 continue
+            if self.stack is None:
+                if resolve_action(key) == Action.QUIT:
+                    return
+                continue
             if key == curses.KEY_MOUSE:
                 self._handle_mouse()
                 continue
@@ -455,20 +459,25 @@ class BrowserApp:
     def _draw(self) -> None:
         self.stdscr.erase()
         height, width = self.stdscr.getmaxyx()
+        if height < 4 or width < 20:
+            message = _truncate("终端窗口太小", max(width - 1, 0))
+            self.stdscr.addstr(0, 0, message)
+            self.stdscr.refresh()
+            return
         if self.stack is None:
             shown = _truncate(self.status, width - 1)
-            self.stdscr.addnstr(0, 0, shown, len(shown))
+            self.stdscr.addstr(0, 0, shown)
             self.stdscr.refresh()
             return
 
         frame = self.stack.current
         breadcrumb = _truncate(frame.url, width - 1)
-        self.stdscr.addnstr(0, 0, breadcrumb, len(breadcrumb), curses.A_REVERSE)
+        self.stdscr.addstr(0, 0, breadcrumb, curses.A_REVERSE)
 
         size_width, mtime_width = 8, 16
         name_width = max(width - size_width - mtime_width - 3, 8)
         header = f"{_ljust('名称', name_width)} {_rjust('大小', size_width)} {_rjust('修改时间', mtime_width)}"
-        self.stdscr.addnstr(1, 0, header, len(header), curses.A_BOLD)
+        self.stdscr.addstr(1, 0, header, curses.A_BOLD)
 
         visible = self._page_size()
         for row, entry in enumerate(frame.entries[frame.offset: frame.offset + visible]):
@@ -480,9 +489,9 @@ class BrowserApp:
             attr = curses.A_REVERSE if frame.offset + row == frame.selected else curses.A_NORMAL
             if entry.is_dir:
                 attr |= self.dir_attr
-            self.stdscr.addnstr(y, 0, line, len(line), attr)
+            self.stdscr.addstr(y, 0, line, attr)
 
         status = self.status or "↑/↓ 移动   Enter/点击 进入或下载   Backspace 返回上级   q 退出"
         shown_status = _truncate(status, width - 1)
-        self.stdscr.addnstr(height - 1, 0, shown_status, len(shown_status), curses.A_DIM)
+        self.stdscr.addstr(height - 1, 0, shown_status, curses.A_DIM)
         self.stdscr.refresh()
