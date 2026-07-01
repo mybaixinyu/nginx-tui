@@ -4,6 +4,7 @@ import curses
 import datetime
 import enum
 import html.parser
+import http.client
 import locale
 import os
 import re
@@ -323,7 +324,7 @@ class BrowserApp:
         try:
             html_text = fetch_index(url)
             entries = parse_index(html_text, url)
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
             self.status = f"加载失败 {url}：{exc}"
             return False
         if push and self.stack is not None:
@@ -436,7 +437,7 @@ class BrowserApp:
             download_file(entry.url, dest_path, progress_cb=on_progress)
         except KeyboardInterrupt:
             self.status = "下载已中断"
-        except (urllib.error.URLError, OSError) as exc:
+        except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
             self.status = f"下载失败：{exc}"
         else:
             self.status = f"已下载到 {dest_path}"
