@@ -616,6 +616,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Must run before curses.wrapper()/initscr() so the window's encoding
     # resolves to the process locale (needed for the Chinese UI text to render).
     locale.setlocale(locale.LC_ALL, "")
+    # ncurses waits ESCDELAY ms after a lone Esc byte before delivering it,
+    # in case more bytes are coming (arrow/function keys are also Esc-prefixed
+    # sequences); the 1000ms default makes Esc-to-go-back feel laggy. Only
+    # set a default — don't override a value the user already configured.
+    os.environ.setdefault("ESCDELAY", "25")
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
         os.makedirs(args.output_dir, exist_ok=True)

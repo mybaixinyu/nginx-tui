@@ -406,6 +406,23 @@ class TestMain(unittest.TestCase):
         self.assertIn("无法创建输出目录", err.getvalue())
         wrapper_mock.assert_not_called()
 
+    def test_sets_escdelay_default_for_responsive_esc(self):
+        with unittest.mock.patch("nginx_tui.locale.setlocale"), \
+            unittest.mock.patch("nginx_tui.os.makedirs"), \
+            unittest.mock.patch("nginx_tui.curses.wrapper"), \
+            unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ESCDELAY", None)
+            main(["http://example.com/files/"])
+            self.assertEqual(os.environ.get("ESCDELAY"), "25")
+
+    def test_does_not_override_existing_escdelay(self):
+        with unittest.mock.patch("nginx_tui.locale.setlocale"), \
+            unittest.mock.patch("nginx_tui.os.makedirs"), \
+            unittest.mock.patch("nginx_tui.curses.wrapper"), \
+            unittest.mock.patch.dict(os.environ, {"ESCDELAY": "100"}):
+            main(["http://example.com/files/"])
+            self.assertEqual(os.environ.get("ESCDELAY"), "100")
+
 
 class TestResolveAction(unittest.TestCase):
     def test_up_arrow_and_k_move_up(self):
