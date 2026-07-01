@@ -21,10 +21,15 @@ PROGRESS_THROTTLE_SECONDS = 0.1
 _USER_AGENT = "nginx-tui/1.0"
 
 
+_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+
+
 def normalize_url(raw_url: str) -> str:
-    if not urllib.parse.urlparse(raw_url).scheme:
-        return "http://" + raw_url
-    return raw_url
+    # urlparse().scheme misparses "localhost:8000/x" as scheme="localhost";
+    # requiring "://" right after the scheme name avoids that false positive.
+    if _SCHEME_RE.match(raw_url):
+        return raw_url
+    return "http://" + raw_url
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

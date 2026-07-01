@@ -16,6 +16,12 @@ class TestNormalizeUrl(unittest.TestCase):
     def test_keeps_https_scheme(self):
         self.assertEqual(normalize_url("https://example.com/files/"), "https://example.com/files/")
 
+    def test_adds_http_scheme_to_hostname_with_port(self):
+        self.assertEqual(normalize_url("localhost:8000/files/"), "http://localhost:8000/files/")
+
+    def test_adds_http_scheme_to_ip_with_port(self):
+        self.assertEqual(normalize_url("127.0.0.1:8080"), "http://127.0.0.1:8080")
+
 
 class TestParseArgs(unittest.TestCase):
     def test_no_args_prints_help_and_exits_zero(self):
