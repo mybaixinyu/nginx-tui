@@ -228,3 +228,65 @@ class NavigationStack:
 
     def at_root(self) -> bool:
         return len(self._frames) <= 1
+
+
+class Action(enum.Enum):
+    MOVE_UP = "move_up"
+    MOVE_DOWN = "move_down"
+    PAGE_UP = "page_up"
+    PAGE_DOWN = "page_down"
+    ACTIVATE = "activate"
+    BACK = "back"
+    QUIT = "quit"
+
+
+_KEY_ACTIONS = {
+    curses.KEY_UP: Action.MOVE_UP,
+    ord("k"): Action.MOVE_UP,
+    curses.KEY_DOWN: Action.MOVE_DOWN,
+    ord("j"): Action.MOVE_DOWN,
+    curses.KEY_PPAGE: Action.PAGE_UP,
+    curses.KEY_NPAGE: Action.PAGE_DOWN,
+    10: Action.ACTIVATE,
+    13: Action.ACTIVATE,
+    curses.KEY_ENTER: Action.ACTIVATE,
+    curses.KEY_BACKSPACE: Action.BACK,
+    127: Action.BACK,
+    curses.KEY_LEFT: Action.BACK,
+    ord("u"): Action.BACK,
+    ord("q"): Action.QUIT,
+    ord("Q"): Action.QUIT,
+}
+
+
+def resolve_action(key: int) -> Optional[Action]:
+    return _KEY_ACTIONS.get(key)
+
+
+def _display_width(text: str) -> int:
+    """Terminal column width: East-Asian wide/fullwidth characters count as 2."""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def _truncate(text: str, max_width: int) -> str:
+    result = ""
+    for ch in text:
+        if _display_width(result + ch) > max_width:
+            break
+        result += ch
+    return result
+
+
+def _ljust(text: str, width: int) -> str:
+    return text + " " * max(width - _display_width(text), 0)
+
+
+def _rjust(text: str, width: int) -> str:
+    return " " * max(width - _display_width(text), 0) + text
+
+
+def format_row(entry: Entry, name_width: int) -> str:
+    name = entry.name
+    if _display_width(name) > name_width:
+        name = _truncate(name, name_width - 1) + "…"
+    return _ljust(name, name_width)

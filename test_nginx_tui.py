@@ -1,3 +1,4 @@
+import curses
 import functools
 import http.server
 import io
@@ -10,7 +11,7 @@ import unittest.mock
 import urllib.error
 from contextlib import redirect_stdout
 
-from nginx_tui import normalize_url, parse_args, Entry, format_mtime, format_size, parse_index, download_file, fetch_index, NavigationStack
+from nginx_tui import normalize_url, parse_args, Entry, format_mtime, format_size, parse_index, download_file, fetch_index, NavigationStack, Action, _display_width, format_row, resolve_action
 
 
 class TestNormalizeUrl(unittest.TestCase):
@@ -252,6 +253,62 @@ class TestNavigationStack(unittest.TestCase):
         popped = stack.pop()
         self.assertFalse(popped)
         self.assertTrue(stack.at_root())
+
+
+class TestResolveAction(unittest.TestCase):
+    def test_up_arrow_and_k_move_up(self):
+        self.assertEqual(resolve_action(curses.KEY_UP), Action.MOVE_UP)
+        self.assertEqual(resolve_action(ord("k")), Action.MOVE_UP)
+
+    def test_down_arrow_and_j_move_down(self):
+        self.assertEqual(resolve_action(curses.KEY_DOWN), Action.MOVE_DOWN)
+        self.assertEqual(resolve_action(ord("j")), Action.MOVE_DOWN)
+
+    def test_page_up_and_down(self):
+        self.assertEqual(resolve_action(curses.KEY_PPAGE), Action.PAGE_UP)
+        self.assertEqual(resolve_action(curses.KEY_NPAGE), Action.PAGE_DOWN)
+
+    def test_enter_variants_activate(self):
+        self.assertEqual(resolve_action(10), Action.ACTIVATE)
+        self.assertEqual(resolve_action(13), Action.ACTIVATE)
+        self.assertEqual(resolve_action(curses.KEY_ENTER), Action.ACTIVATE)
+
+    def test_backspace_variants_go_back(self):
+        self.assertEqual(resolve_action(curses.KEY_BACKSPACE), Action.BACK)
+        self.assertEqual(resolve_action(127), Action.BACK)
+        self.assertEqual(resolve_action(curses.KEY_LEFT), Action.BACK)
+        self.assertEqual(resolve_action(ord("u")), Action.BACK)
+
+    def test_q_quits(self):
+        self.assertEqual(resolve_action(ord("q")), Action.QUIT)
+        self.assertEqual(resolve_action(ord("Q")), Action.QUIT)
+
+    def test_unmapped_key_returns_none(self):
+        self.assertIsNone(resolve_action(ord("z")))
+
+
+class TestFormatRow(unittest.TestCase):
+    def test_short_name_is_padded(self):
+        entry = Entry(name="a.txt", href="a.txt", url="http://x/a.txt", is_dir=False, size_bytes=1, mtime=None)
+        self.assertEqual(format_row(entry, 10), "a.txt     ")
+
+    def test_long_name_is_truncated_with_ellipsis(self):
+        entry = Entry(
+            name="a_very_long_filename.txt", href="x", url="http://x/x",
+            is_dir=False, size_bytes=1, mtime=None,
+        )
+        result = format_row(entry, 10)
+        self.assertEqual(len(result), 10)
+        self.assertTrue(result.endswith("…"))
+
+    def test_wide_characters_are_truncated_by_display_width_not_char_count(self):
+        entry = Entry(
+            name="文件名超长测试文件名超长测试.txt", href="x", url="http://x/x",
+            is_dir=False, size_bytes=1, mtime=None,
+        )
+        result = format_row(entry, 10)
+        self.assertEqual(_display_width(result), 10)
+        self.assertTrue(result.rstrip().endswith("…"))
 
 
 if __name__ == "__main__":
