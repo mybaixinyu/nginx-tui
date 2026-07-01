@@ -290,3 +290,199 @@ def format_row(entry: Entry, name_width: int) -> str:
     if _display_width(name) > name_width:
         name = _truncate(name, name_width - 1) + "…"
     return _ljust(name, name_width)
+
+
+class BrowserApp:
+    def __init__(self, stdscr, start_url: str, output_dir: str) -> None:
+        self.stdscr = stdscr
+        self.output_dir = output_dir
+        self.status = ""
+        self.stack: Optional[NavigationStack] = None
+        self.dir_attr = curses.A_BOLD
+        self._init_colors()
+        curses.curs_set(0)
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        except curses.error:
+            pass
+        self.stdscr.keypad(True)
+        self._load(start_url, push=False)
+
+    def _init_colors(self) -> None:
+        if not curses.has_colors():
+            return
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_BLUE, -1)
+        self.dir_attr = curses.color_pair(1) | curses.A_BOLD
+
+    def _load(self, url: str, push: bool) -> bool:
+        self.status = f"正在加载 {url} ..."
+        self._draw()
+        try:
+            html_text = fetch_index(url)
+            entries = parse_index(html_text, url)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            self.status = f"加载失败 {url}：{exc}"
+            return False
+        if push and self.stack is not None:
+            self.stack.push(url, entries)
+        else:
+            self.stack = NavigationStack(url, entries)
+        self.status = ""
+        return True
+
+    def run(self) -> None:
+        while True:
+            self._draw()
+            key = self.stdscr.getch()
+            if key == curses.KEY_RESIZE:
+                continue
+            if key == curses.KEY_MOUSE:
+                self._handle_mouse()
+                continue
+            action = resolve_action(key)
+            if action is None:
+                continue
+            if action == Action.QUIT:
+                return
+            elif action == Action.MOVE_UP:
+                self._move_selection(-1)
+            elif action == Action.MOVE_DOWN:
+                self._move_selection(1)
+            elif action == Action.PAGE_UP:
+                self._move_selection(-self._page_size())
+            elif action == Action.PAGE_DOWN:
+                self._move_selection(self._page_size())
+            elif action == Action.BACK:
+                self._go_back()
+            elif action == Action.ACTIVATE:
+                self._activate_selected()
+
+    def _page_size(self) -> int:
+        height, _ = self.stdscr.getmaxyx()
+        return max(height - 3, 1)
+
+    def _move_selection(self, delta: int) -> None:
+        frame = self.stack.current
+        if not frame.entries:
+            return
+        frame.selected = max(0, min(len(frame.entries) - 1, frame.selected + delta))
+        self._adjust_offset()
+
+    def _adjust_offset(self) -> None:
+        frame = self.stack.current
+        visible = self._page_size()
+        if frame.selected < frame.offset:
+            frame.offset = frame.selected
+        elif frame.selected >= frame.offset + visible:
+            frame.offset = frame.selected - visible + 1
+
+    def _go_back(self) -> None:
+        if not self.stack.pop():
+            self.status = "已在根目录"
+
+    def _handle_mouse(self) -> None:
+        try:
+            _, _, my, _, bstate = curses.getmouse()
+        except curses.error:
+            return
+        if not (bstate & curses.BUTTON1_CLICKED or bstate & curses.BUTTON1_PRESSED):
+            return
+        height, _ = self.stdscr.getmaxyx()
+        if my < 2 or my >= height - 1:
+            return
+        frame = self.stack.current
+        row_index = frame.offset + (my - 2)
+        if 0 <= row_index < len(frame.entries):
+            frame.selected = row_index
+            self._activate_selected()
+
+    def _activate_selected(self) -> None:
+        frame = self.stack.current
+        if not frame.entries:
+            return
+        entry = frame.entries[frame.selected]
+        if entry.is_dir:
+            self._load(entry.url, push=True)
+        else:
+            self._download(entry)
+
+    def _download(self, entry: Entry) -> None:
+        # basename() guards against path traversal via a crafted href
+        dest_path = os.path.join(self.output_dir, os.path.basename(entry.name))
+        if os.path.exists(dest_path):
+            if not self._confirm_overwrite(dest_path):
+                self.status = "已取消下载"
+                return
+
+        last_draw = 0.0
+
+        def on_progress(downloaded: int, total: Optional[int]) -> None:
+            nonlocal last_draw
+            now = time.monotonic()
+            if now - last_draw < PROGRESS_THROTTLE_SECONDS and (total is None or downloaded < total):
+                return
+            last_draw = now
+            self.status = self._format_progress(entry.name, downloaded, total)
+            self._draw()
+
+        try:
+            download_file(entry.url, dest_path, progress_cb=on_progress)
+        except KeyboardInterrupt:
+            self.status = "下载已中断"
+        except (urllib.error.URLError, OSError) as exc:
+            self.status = f"下载失败：{exc}"
+        else:
+            self.status = f"已下载到 {dest_path}"
+
+    @staticmethod
+    def _format_progress(name: str, downloaded: int, total: Optional[int]) -> str:
+        if total:
+            percent = int(downloaded * 100 / total)
+            bar_width = 20
+            filled = int(bar_width * downloaded / total)
+            bar = "=" * filled + "-" * (bar_width - filled)
+            return f"下载中 {name} [{bar}] {percent}% {format_size(downloaded)}/{format_size(total)}"
+        return f"下载中 {name} {format_size(downloaded)}"
+
+    def _confirm_overwrite(self, dest_path: str) -> bool:
+        self.status = f"{os.path.basename(dest_path)} 已存在，是否覆盖？(y/n)"
+        self._draw()
+        key = self.stdscr.getch()
+        return key in (ord("y"), ord("Y"))
+
+    def _draw(self) -> None:
+        self.stdscr.erase()
+        height, width = self.stdscr.getmaxyx()
+        if self.stack is None:
+            shown = _truncate(self.status, width - 1)
+            self.stdscr.addnstr(0, 0, shown, len(shown))
+            self.stdscr.refresh()
+            return
+
+        frame = self.stack.current
+        breadcrumb = _truncate(frame.url, width - 1)
+        self.stdscr.addnstr(0, 0, breadcrumb, len(breadcrumb), curses.A_REVERSE)
+
+        size_width, mtime_width = 8, 16
+        name_width = max(width - size_width - mtime_width - 3, 8)
+        header = f"{_ljust('名称', name_width)} {_rjust('大小', size_width)} {_rjust('修改时间', mtime_width)}"
+        self.stdscr.addnstr(1, 0, header, len(header), curses.A_BOLD)
+
+        visible = self._page_size()
+        for row, entry in enumerate(frame.entries[frame.offset: frame.offset + visible]):
+            y = row + 2
+            name_col = format_row(entry, name_width)
+            size_col = _rjust(format_size(entry.size_bytes), size_width)
+            mtime_col = _rjust(entry.mtime or "", mtime_width)
+            line = f"{name_col} {size_col} {mtime_col}"
+            attr = curses.A_REVERSE if frame.offset + row == frame.selected else curses.A_NORMAL
+            if entry.is_dir:
+                attr |= self.dir_attr
+            self.stdscr.addnstr(y, 0, line, len(line), attr)
+
+        status = self.status or "↑/↓ 移动   Enter/点击 进入或下载   Backspace 返回上级   q 退出"
+        shown_status = _truncate(status, width - 1)
+        self.stdscr.addnstr(height - 1, 0, shown_status, len(shown_status), curses.A_DIM)
+        self.stdscr.refresh()
