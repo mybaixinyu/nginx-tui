@@ -357,6 +357,7 @@ class BrowserApp:
         self.stack: Optional[NavigationStack] = None
         self.dir_attr = curses.A_BOLD
         self.header_attr = curses.A_REVERSE | curses.A_BOLD
+        self.footer_attr = curses.A_BOLD
         self._init_colors()
         curses.curs_set(0)
         try:
@@ -396,6 +397,10 @@ class BrowserApp:
         # colors, which can render low-contrast in some dark color schemes.
         curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE)
         self.header_attr = curses.color_pair(2) | curses.A_BOLD
+        # Bold cyan instead of A_DIM for the footer hint — dimming reduces
+        # contrast further and can render unreadable on dark color schemes.
+        curses.init_pair(3, curses.COLOR_CYAN, -1)
+        self.footer_attr = curses.color_pair(3) | curses.A_BOLD
 
     def _load(self, url: str, push: bool) -> bool:
         display_url = urllib.parse.unquote(url)
@@ -629,7 +634,7 @@ class BrowserApp:
             "r/R/F5 刷新  Backspace/←/u/Esc 返回上级  q 退出"
         )
         shown_status = _truncate(status, width - 1)
-        self.stdscr.addstr(height - 1, 0, shown_status, curses.A_DIM)
+        self.stdscr.addstr(height - 1, 0, shown_status, self.footer_attr)
         if self._status_visible():
             self._draw_center_message(height, width, self.status)
         self.stdscr.refresh()

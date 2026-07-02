@@ -510,6 +510,49 @@ class TestBreadcrumbDisplay(unittest.TestCase):
         init_pair_mock.assert_any_call(2, curses.COLOR_WHITE, curses.COLOR_BLUE)
         self.assertEqual(app.header_attr, 200 | curses.A_BOLD)
 
+    def test_footer_attr_falls_back_to_bold_without_color_support(self):
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+        self.assertEqual(app.footer_attr, curses.A_BOLD)
+        self.assertNotEqual(app.footer_attr & curses.A_DIM, curses.A_DIM)
+
+    def test_footer_attr_uses_fixed_cyan_pair_with_color_support(self):
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=True), \
+            unittest.mock.patch("nginx_tui.curses.start_color"), \
+            unittest.mock.patch("nginx_tui.curses.use_default_colors"), \
+            unittest.mock.patch("nginx_tui.curses.init_pair") as init_pair_mock, \
+            unittest.mock.patch("nginx_tui.curses.color_pair", side_effect=lambda n: n * 100), \
+            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+        init_pair_mock.assert_any_call(3, curses.COLOR_CYAN, -1)
+        self.assertEqual(app.footer_attr, 300 | curses.A_BOLD)
+
+    def test_footer_line_no_longer_uses_dim_attribute(self):
+        class _RecordingStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = []
+
+            def addstr(self, *args, **kwargs):
+                self.calls.append(args)
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_RecordingStdScr(), "http://x/", "/tmp")
+            app.stdscr.calls.clear()
+            app._draw()
+        footer_call = next(c for c in app.stdscr.calls if c[0] == 23)  # height-1 for the 24x100 fake screen
+        self.assertNotEqual(footer_call[3] & curses.A_DIM, curses.A_DIM)
+
 
 class TestDrawResilience(unittest.TestCase):
     def test_curses_error_during_draw_does_not_propagate(self):
