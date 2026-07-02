@@ -191,13 +191,19 @@ def format_mtime(raw: Optional[str]) -> Optional[str]:
     month = _MONTHS.get(match.group("mon"))
     if month is None:
         return raw
-    parsed = datetime.datetime(
-        int(match.group("year")),
-        month,
-        int(match.group("day")),
-        int(match.group("hour")),
-        int(match.group("minute")),
-    )
+    try:
+        parsed = datetime.datetime(
+            int(match.group("year")),
+            month,
+            int(match.group("day")),
+            int(match.group("hour")),
+            int(match.group("minute")),
+        )
+    except ValueError:
+        # Syntactically matches (2-digit day/hour/minute) but not a real date
+        # (e.g. day 31 in February) -- degrade this one entry, don't let it
+        # abort parsing of the whole directory listing.
+        return raw
     return parsed.strftime("%Y-%m-%d %H:%M")
 
 
@@ -263,8 +269,10 @@ def download_file(
             total_header = response.headers.get("Content-Length")
             total_bytes = int(total_header) if total_header is not None else None
             downloaded = 0
+            # Set before open() (not after) so there's no gap where the file
+            # has been created/truncated but the flag doesn't reflect it yet.
+            opened_part = True
             with open(part_path, "wb") as out_file:
-                opened_part = True
                 while True:
                     chunk = response.read(CHUNK_SIZE)
                     if not chunk:
@@ -690,11 +698,23 @@ class BrowserApp:
             if key == -1:
                 continue
             if key == curses.KEY_RESIZE:
-                # Not a keyboard answer -- redraw for the new size and keep waiting.
-                self._draw()
+                # Not a keyboard answer -- reclamp/redraw for the new size and
+                # keep waiting (this resize is consumed here, so run()'s own
+                # KEY_RESIZE handling never sees it to do this for us).
+                self._clamp_viewport()
+                try:
+                    self._draw()
+                except KeyboardInterrupt:
+                    return False
                 continue
             if key == curses.KEY_MOUSE:
-                # Not a keyboard answer either (mouse move/click while confirming).
+                # Not a keyboard answer either (mouse move/click while
+                # confirming) -- still drain it, or it desyncs the mouse
+                # event queue and a later click acts on stale coordinates.
+                try:
+                    curses.getmouse()
+                except curses.error:
+                    pass
                 continue
             return key in (ord("y"), ord("Y"))
 

@@ -150,6 +150,10 @@ class TestFormatMtime(unittest.TestCase):
     def test_unparseable_falls_back_to_raw(self):
         self.assertEqual(format_mtime("not-a-date"), "not-a-date")
 
+    def test_calendrically_invalid_date_falls_back_to_raw(self):
+        # Matches the day/month/year/hour/minute shape but Feb never has 31 days.
+        self.assertEqual(format_mtime("31-Feb-2024 10:00"), "31-Feb-2024 10:00")
+
 
 class TestParseIndex(unittest.TestCase):
     def test_skips_parent_dir_entry(self):
@@ -208,6 +212,17 @@ class TestParseIndex(unittest.TestCase):
         self.assertEqual(weird.name, "weird.bin")
         self.assertIsNone(weird.size_bytes)
         self.assertIsNone(weird.mtime)
+
+    def test_calendrically_invalid_date_does_not_abort_the_whole_listing(self):
+        html_text = (
+            "<html><body><pre>\n"
+            '<a href="f.bin">f.bin</a>          31-Feb-2024 10:00          123\n'
+            "</pre></body></html>"
+        )
+        entries = parse_index(html_text, "http://example.com/files/")
+        entry = entries[0]
+        self.assertEqual(entry.name, "f.bin")
+        self.assertEqual(entry.mtime, "31-Feb-2024 10:00")
 
     def test_genuinely_empty_directory_returns_no_entries(self):
         # A real empty nginx directory still lists the "../" anchor.
@@ -317,6 +332,15 @@ class TestDownloadFile(_ServerTestCase):
         dest_path = os.path.join(self.dest_dir, "missing.bin")
         with self.assertRaises(urllib.error.HTTPError):
             download_file(self.base_url + "missing.bin", dest_path)
+        self.assertFalse(os.path.exists(dest_path + ".part"))
+
+    def test_open_failure_propagates_cleanly_without_a_part_file(self):
+        with open(os.path.join(self.serve_dir, "blocked.bin"), "wb") as f:
+            f.write(b"x" * 100)
+        dest_path = os.path.join(self.dest_dir, "blocked.bin")
+        with unittest.mock.patch("nginx_tui.open", side_effect=PermissionError("denied"), create=True):
+            with self.assertRaises(PermissionError):
+                download_file(self.base_url + "blocked.bin", dest_path)
         self.assertFalse(os.path.exists(dest_path + ".part"))
 
 
@@ -601,6 +625,86 @@ class TestConfirmOverwrite(unittest.TestCase):
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
             app.stdscr = _EscStdScr()
             result = app._confirm_overwrite("/tmp/dl/existing.txt")
+        self.assertFalse(result)
+
+    def test_mouse_event_is_drained_not_left_queued(self):
+        class _MouseThenAnswerStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = 0
+
+            def getch(self):
+                self.calls += 1
+                return curses.KEY_MOUSE if self.calls == 1 else ord("n")
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            app.stdscr = _MouseThenAnswerStdScr()
+            with unittest.mock.patch("nginx_tui.curses.getmouse") as getmouse_mock:
+                result = app._confirm_overwrite("/tmp/dl/existing.txt")
+        getmouse_mock.assert_called_once()
+        self.assertFalse(result)
+
+    def test_resize_during_prompt_clamps_viewport(self):
+        entries = [_make_entry(f"f{i}.txt") for i in range(100)]
+
+        class _ResizeThenAnswerStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = 0
+                self.size = (10, 100)  # shrunk while the prompt is up -> visible=7
+
+            def getmaxyx(self):
+                return self.size
+
+            def getch(self):
+                self.calls += 1
+                return curses.KEY_RESIZE if self.calls == 1 else ord("y")
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=entries):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            app.stack.current.selected = 99
+            app.stack.current.offset = 79
+            app.stdscr = _ResizeThenAnswerStdScr()
+            result = app._confirm_overwrite("/tmp/dl/existing.txt")
+        frame = app.stack.current
+        visible = app._page_size()
+        self.assertTrue(frame.offset <= frame.selected < frame.offset + visible)
+        self.assertTrue(result)
+
+    def test_keyboard_interrupt_during_resize_redraw_cancels(self):
+        class _ResizeThenAnswerStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = 0
+
+            def getch(self):
+                self.calls += 1
+                return curses.KEY_RESIZE if self.calls == 1 else ord("y")
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            app.stdscr = _ResizeThenAnswerStdScr()
+            real_draw = app._draw
+            draw_calls = []
+
+            def flaky_draw():
+                draw_calls.append(1)
+                if len(draw_calls) == 2:
+                    raise KeyboardInterrupt
+                real_draw()
+
+            with unittest.mock.patch.object(app, "_draw", side_effect=flaky_draw):
+                result = app._confirm_overwrite("/tmp/dl/existing.txt")
         self.assertFalse(result)
 
 
