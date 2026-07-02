@@ -268,6 +268,7 @@ class Action(enum.Enum):
     PAGE_DOWN = "page_down"
     REFRESH = "refresh"
     ACTIVATE = "activate"
+    ENTER_DIR = "enter_dir"
     BACK = "back"
     QUIT = "quit"
 
@@ -284,6 +285,7 @@ _KEY_ACTIONS = {
     10: Action.ACTIVATE,
     13: Action.ACTIVATE,
     curses.KEY_ENTER: Action.ACTIVATE,
+    curses.KEY_RIGHT: Action.ENTER_DIR,
     curses.KEY_BACKSPACE: Action.BACK,
     127: Action.BACK,
     curses.KEY_LEFT: Action.BACK,
@@ -426,6 +428,8 @@ class BrowserApp:
                 self._go_back()
             elif action == Action.ACTIVATE:
                 self._activate_selected()
+            elif action == Action.ENTER_DIR:
+                self._enter_dir_selected()
 
     def _page_size(self) -> int:
         height, _ = self.stdscr.getmaxyx()
@@ -494,6 +498,14 @@ class BrowserApp:
             self._load(entry.url, push=True)
         else:
             self._download(entry)
+
+    def _enter_dir_selected(self) -> None:
+        frame = self.stack.current
+        if not frame.entries:
+            return
+        entry = frame.entries[frame.selected]
+        if entry.is_dir:
+            self._load(entry.url, push=True)
 
     def _download(self, entry: Entry) -> None:
         # basename() guards against path traversal via a crafted href
@@ -590,7 +602,7 @@ class BrowserApp:
             self.stdscr.addstr(y, 0, line, attr)
 
         status = (
-            "↑/↓/j/k 移动  PgUp/PgDn 翻页  Enter/点击 进入或下载  "
+            "↑/↓/j/k 移动  PgUp/PgDn 翻页  Enter/点击 进入或下载  → 进入目录  "
             "r/R/F5 刷新  Backspace/←/u/Esc 返回上级  q 退出"
         )
         shown_status = _truncate(status, width - 1)

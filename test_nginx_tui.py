@@ -324,6 +324,35 @@ class TestRefreshCurrent(unittest.TestCase):
         self.assertEqual(app.stack.current.selected, 0)
 
 
+class TestEnterDirSelected(unittest.TestCase):
+    def test_enters_directory(self):
+        dir_entries = [Entry("subdir/", "subdir/", "http://x/subdir/", True, None, None)]
+        child_entries = [Entry("inner.txt", "inner.txt", "http://x/subdir/inner.txt", False, 1, None)]
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=dir_entries):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            with unittest.mock.patch("nginx_tui.parse_index", return_value=child_entries):
+                app._enter_dir_selected()
+        self.assertEqual(app.stack.current.entries, child_entries)
+        self.assertEqual(app.stack.current.url, "http://x/subdir/")
+
+    def test_does_not_download_a_selected_file(self):
+        file_entries = [Entry("notes.txt", "notes.txt", "http://x/notes.txt", False, 12, None)]
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=file_entries), \
+            unittest.mock.patch("nginx_tui.download_file") as download_mock:
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            app._enter_dir_selected()
+        download_mock.assert_not_called()
+        self.assertEqual(app.stack.current.entries, file_entries)
+
+
 class TestConfirmOverwrite(unittest.TestCase):
     def test_keyboard_interrupt_cancels_instead_of_propagating(self):
         class _InterruptingStdScr(_FakeStdScr):
@@ -445,6 +474,9 @@ class TestResolveAction(unittest.TestCase):
         self.assertEqual(resolve_action(10), Action.ACTIVATE)
         self.assertEqual(resolve_action(13), Action.ACTIVATE)
         self.assertEqual(resolve_action(curses.KEY_ENTER), Action.ACTIVATE)
+
+    def test_right_arrow_maps_to_enter_dir(self):
+        self.assertEqual(resolve_action(curses.KEY_RIGHT), Action.ENTER_DIR)
 
     def test_backspace_variants_go_back(self):
         self.assertEqual(resolve_action(curses.KEY_BACKSPACE), Action.BACK)
