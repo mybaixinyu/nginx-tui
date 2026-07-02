@@ -269,10 +269,15 @@ def download_file(
             total_header = response.headers.get("Content-Length")
             total_bytes = int(total_header) if total_header is not None else None
             downloaded = 0
-            # Set before open() (not after) so there's no gap where the file
-            # has been created/truncated but the flag doesn't reflect it yet.
-            opened_part = True
             with open(part_path, "wb") as out_file:
+                # Only set once open() has actually succeeded -- a failed
+                # open() must never trigger the cleanup below to delete a
+                # pre-existing file this call never touched. (A signal
+                # landing in the handful of bytecodes between open()
+                # returning and this line executing is a real but
+                # astronomically unlikely race, not worth trading this
+                # guarantee away for.)
+                opened_part = True
                 while True:
                     chunk = response.read(CHUNK_SIZE)
                     if not chunk:
@@ -642,7 +647,10 @@ class BrowserApp:
             self._set_status(f"无法下载：文件名无效（{entry.name!r}）", timeout=2.0)
             return
         dest_path = os.path.join(self.output_dir, basename)
-        if os.path.exists(dest_path):
+        # Also guard the ".part" staging path -- download_file truncates it
+        # unconditionally, so without this check a pre-existing (unrelated)
+        # "<name>.part" file would be silently destroyed with no prompt.
+        if os.path.exists(dest_path) or os.path.exists(dest_path + ".part"):
             if not self._confirm_overwrite(dest_path):
                 self._set_status("已取消下载", timeout=1.5)
                 return

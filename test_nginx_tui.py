@@ -5,6 +5,7 @@ import io
 import os
 import shutil
 import ssl
+import stat
 import subprocess
 import tempfile
 import threading
@@ -334,14 +335,24 @@ class TestDownloadFile(_ServerTestCase):
             download_file(self.base_url + "missing.bin", dest_path)
         self.assertFalse(os.path.exists(dest_path + ".part"))
 
-    def test_open_failure_propagates_cleanly_without_a_part_file(self):
+    def test_open_failure_does_not_delete_a_preexisting_part_file(self):
+        # Regression test: opened_part must only become True once open()
+        # has actually succeeded, or a failed open() on a pre-existing
+        # ".part" file (e.g. read-only) wrongly deletes a file this call
+        # never touched.
         with open(os.path.join(self.serve_dir, "blocked.bin"), "wb") as f:
             f.write(b"x" * 100)
         dest_path = os.path.join(self.dest_dir, "blocked.bin")
-        with unittest.mock.patch("nginx_tui.open", side_effect=PermissionError("denied"), create=True):
-            with self.assertRaises(PermissionError):
-                download_file(self.base_url + "blocked.bin", dest_path)
-        self.assertFalse(os.path.exists(dest_path + ".part"))
+        part_path = dest_path + ".part"
+        with open(part_path, "wb") as f:
+            f.write(b"PRE_EXISTING_UNRELATED_DATA")
+        os.chmod(part_path, stat.S_IRUSR)
+        self.addCleanup(os.chmod, part_path, stat.S_IRUSR | stat.S_IWUSR)
+        with self.assertRaises(PermissionError):
+            download_file(self.base_url + "blocked.bin", dest_path)
+        self.assertTrue(os.path.exists(part_path))
+        with open(part_path, "rb") as f:
+            self.assertEqual(f.read(), b"PRE_EXISTING_UNRELATED_DATA")
 
 
 class TestSslContext(unittest.TestCase):
@@ -706,6 +717,29 @@ class TestConfirmOverwrite(unittest.TestCase):
             with unittest.mock.patch.object(app, "_draw", side_effect=flaky_draw):
                 result = app._confirm_overwrite("/tmp/dl/existing.txt")
         self.assertFalse(result)
+
+
+class TestDownloadOverwriteCheck(unittest.TestCase):
+    def test_preexisting_part_file_triggers_overwrite_confirmation(self):
+        # dest_path itself doesn't exist -- only its ".part" staging file
+        # does -- and that must still prompt, or download_file would
+        # silently truncate it (download_file always opens part_path "wb").
+        output_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, output_dir, ignore_errors=True)
+        with open(os.path.join(output_dir, "movie.mkv.part"), "wb") as f:
+            f.write(b"PRE_EXISTING_UNRELATED_DATA")
+        entries = [Entry("movie.mkv", "movie.mkv", "http://x/movie.mkv", False, 100, None)]
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=entries), \
+            unittest.mock.patch("nginx_tui.download_file") as download_mock:
+            app = BrowserApp(_FakeStdScr(), "http://x/", output_dir)
+            with unittest.mock.patch.object(app, "_confirm_overwrite", return_value=False) as confirm_mock:
+                app._activate_selected()
+        confirm_mock.assert_called_once()
+        download_mock.assert_not_called()
 
 
 class TestBreadcrumbDisplay(unittest.TestCase):
