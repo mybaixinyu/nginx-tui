@@ -459,9 +459,9 @@ class BrowserApp:
             elif action == Action.MOVE_DOWN:
                 self._move_selection(1)
             elif action == Action.PAGE_UP:
-                self._move_selection(-self._page_size())
+                self._page_move(-1)
             elif action == Action.PAGE_DOWN:
-                self._move_selection(self._page_size())
+                self._page_move(1)
             elif action == Action.REFRESH:
                 self._refresh_current()
             elif action == Action.BACK:
@@ -481,6 +481,22 @@ class BrowserApp:
             return
         frame.selected = max(0, min(len(frame.entries) - 1, frame.selected + delta))
         self._adjust_offset()
+
+    def _page_move(self, direction: int) -> None:
+        # Shift both selected and offset by a full page directly, instead of
+        # routing through _adjust_offset()'s minimal-scroll logic (designed
+        # for single-line moves) -- that only nudges the viewport by however
+        # far selected overshot it, which is just 1 line whenever selected
+        # started exactly on the edge closest to the direction of travel
+        # (e.g. the very first PageDown from the top of the list).
+        frame = self.stack.current
+        if not frame.entries:
+            return
+        visible = self._page_size()
+        step = direction * visible
+        frame.selected = max(0, min(len(frame.entries) - 1, frame.selected + step))
+        max_offset = max(len(frame.entries) - visible, 0)
+        frame.offset = max(0, min(max_offset, frame.offset + step))
 
     def _adjust_offset(self) -> None:
         frame = self.stack.current

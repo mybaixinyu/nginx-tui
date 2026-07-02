@@ -644,6 +644,67 @@ class TestDrawResilience(unittest.TestCase):
             app._draw()  # must not raise curses.error
 
 
+def _make_app_with_entries(count):
+    entries = [_make_entry(f"f{i}.txt") for i in range(count)]
+    with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+        unittest.mock.patch("nginx_tui.curses.mousemask"), \
+        unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+        unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+        unittest.mock.patch("nginx_tui.parse_index", return_value=entries):
+        return BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+
+
+class TestPageMove(unittest.TestCase):
+    # _FakeStdScr.getmaxyx() is (24, 100) -> _page_size() == 21
+    def test_page_down_from_top_scrolls_a_full_page_not_one_line(self):
+        app = _make_app_with_entries(100)
+        app._page_move(1)
+        self.assertEqual(app.stack.current.selected, 21)
+        self.assertEqual(app.stack.current.offset, 21)
+
+    def test_page_down_repeated_lands_on_final_page_without_overshoot(self):
+        app = _make_app_with_entries(100)
+        for _ in range(10):
+            app._page_move(1)
+        frame = app.stack.current
+        self.assertEqual(frame.selected, 99)
+        self.assertEqual(frame.offset, 79)  # max_offset = 100 - 21
+        # idempotent once fully scrolled
+        app._page_move(1)
+        self.assertEqual(frame.selected, 99)
+        self.assertEqual(frame.offset, 79)
+
+    def test_page_up_after_page_down_preserves_relative_row(self):
+        app = _make_app_with_entries(100)
+        app._page_move(1)  # selected=21, offset=21 (top of viewport)
+        app._page_move(1)  # selected=42, offset=42 (top of viewport)
+        app._page_move(-1)
+        frame = app.stack.current
+        self.assertEqual(frame.selected, 21)
+        self.assertEqual(frame.offset, 21)
+
+    def test_page_up_from_top_of_list_clamps_to_start(self):
+        app = _make_app_with_entries(100)
+        app._page_move(-1)
+        frame = app.stack.current
+        self.assertEqual(frame.selected, 0)
+        self.assertEqual(frame.offset, 0)
+
+    def test_page_move_on_short_list_keeps_offset_at_zero(self):
+        app = _make_app_with_entries(5)
+        app._page_move(1)
+        frame = app.stack.current
+        self.assertEqual(frame.selected, 4)
+        self.assertEqual(frame.offset, 0)
+
+    def test_page_move_on_empty_list_is_a_noop(self):
+        app = _make_app_with_entries(0)
+        app._page_move(1)  # must not raise
+        frame = app.stack.current
+        self.assertEqual(frame.selected, 0)
+        self.assertEqual(frame.offset, 0)
+
+
 class TestResizeAdjustsOffset(unittest.TestCase):
     def test_resize_key_triggers_offset_adjustment(self):
         class _ResizeThenQuitStdScr(_FakeStdScr):
