@@ -19,6 +19,7 @@ from nginx_tui import (
     Entry,
     NavigationStack,
     _display_width,
+    _format_duration,
     _ssl_context,
     download_file,
     fetch_index,
@@ -448,14 +449,36 @@ class TestLoadCancellation(unittest.TestCase):
         self.assertIn("已取消加载", app.status)
 
 
-class TestFormatProgressCancelHint(unittest.TestCase):
+class TestFormatDuration(unittest.TestCase):
+    def test_under_a_minute(self):
+        self.assertEqual(_format_duration(12), "0:12")
+
+    def test_pads_seconds_below_ten(self):
+        self.assertEqual(_format_duration(65), "1:05")
+
+    def test_multiple_minutes(self):
+        self.assertEqual(_format_duration(724), "12:04")
+
+    def test_negative_clamps_to_zero(self):
+        self.assertEqual(_format_duration(-3), "0:00")
+
+
+class TestFormatProgress(unittest.TestCase):
     def test_includes_cancel_hint_with_known_total(self):
-        text = BrowserApp._format_progress("f.zip", 50, 100)
+        text = BrowserApp._format_progress("f.zip", 50, 100, 12)
         self.assertIn("Ctrl-C", text)
 
     def test_includes_cancel_hint_without_known_total(self):
-        text = BrowserApp._format_progress("f.zip", 50, None)
+        text = BrowserApp._format_progress("f.zip", 50, None, 12)
         self.assertIn("Ctrl-C", text)
+
+    def test_includes_elapsed_time_with_known_total(self):
+        text = BrowserApp._format_progress("f.zip", 50, 100, 65)
+        self.assertIn("1:05", text)
+
+    def test_includes_elapsed_time_without_known_total(self):
+        text = BrowserApp._format_progress("f.zip", 50, None, 65)
+        self.assertIn("1:05", text)
 
 
 class TestEnterDirSelected(unittest.TestCase):

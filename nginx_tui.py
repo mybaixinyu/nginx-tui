@@ -155,6 +155,12 @@ def format_size(size_bytes: Optional[int]) -> str:
     return f"{size:.1f}G"
 
 
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(int(seconds), 0)
+    minutes, secs = divmod(total_seconds, 60)
+    return f"{minutes}:{secs:02d}"
+
+
 def format_mtime(raw: Optional[str]) -> Optional[str]:
     if raw is None:
         return None
@@ -555,6 +561,7 @@ class BrowserApp:
                 return
 
         last_draw = 0.0
+        start_time = time.monotonic()
 
         def on_progress(downloaded: int, total: Optional[int]) -> None:
             nonlocal last_draw
@@ -562,7 +569,8 @@ class BrowserApp:
             if now - last_draw < PROGRESS_THROTTLE_SECONDS and (total is None or downloaded < total):
                 return
             last_draw = now
-            self._set_status(self._format_progress(entry.name, downloaded, total), timeout=1.0)
+            elapsed = now - start_time
+            self._set_status(self._format_progress(entry.name, downloaded, total, elapsed), timeout=1.0)
             self._draw()
 
         try:
@@ -572,17 +580,22 @@ class BrowserApp:
         except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
             self._set_status(f"下载失败：{exc}", timeout=2.0)
         else:
-            self._set_status(f"已下载到 {dest_path}", timeout=2.0)
+            elapsed = time.monotonic() - start_time
+            self._set_status(f"已下载到 {dest_path}（用时 {_format_duration(elapsed)}）", timeout=2.0)
 
     @staticmethod
-    def _format_progress(name: str, downloaded: int, total: Optional[int]) -> str:
+    def _format_progress(name: str, downloaded: int, total: Optional[int], elapsed: float) -> str:
+        duration = _format_duration(elapsed)
         if total:
             percent = int(downloaded * 100 / total)
             bar_width = 20
             filled = int(bar_width * downloaded / total)
             bar = "=" * filled + "-" * (bar_width - filled)
-            return f"下载中 {name} [{bar}] {percent}% {format_size(downloaded)}/{format_size(total)}{_CANCEL_HINT}"
-        return f"下载中 {name} {format_size(downloaded)}{_CANCEL_HINT}"
+            return (
+                f"下载中 {name} [{bar}] {percent}% "
+                f"{format_size(downloaded)}/{format_size(total)} 用时{duration}{_CANCEL_HINT}"
+            )
+        return f"下载中 {name} {format_size(downloaded)} 用时{duration}{_CANCEL_HINT}"
 
     def _confirm_overwrite(self, dest_path: str) -> bool:
         self._set_status(f"{os.path.basename(dest_path)} 已存在，是否覆盖？(y/n)")
