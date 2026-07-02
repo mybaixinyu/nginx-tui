@@ -340,6 +340,7 @@ class BrowserApp:
         self.status_expires_at: Optional[float] = None
         self.stack: Optional[NavigationStack] = None
         self.dir_attr = curses.A_BOLD
+        self.header_attr = curses.A_REVERSE | curses.A_BOLD
         self._init_colors()
         curses.curs_set(0)
         try:
@@ -375,15 +376,20 @@ class BrowserApp:
         curses.use_default_colors()
         curses.init_pair(1, curses.COLOR_BLUE, -1)
         self.dir_attr = curses.color_pair(1) | curses.A_BOLD
+        # Fixed white-on-blue instead of A_REVERSE on the terminal's default
+        # colors, which can render low-contrast in some dark color schemes.
+        curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        self.header_attr = curses.color_pair(2) | curses.A_BOLD
 
     def _load(self, url: str, push: bool) -> bool:
-        self._set_status(f"正在加载 {url} ...")
+        display_url = urllib.parse.unquote(url)
+        self._set_status(f"正在加载 {display_url} ...")
         self._draw()
         try:
             html_text = fetch_index(url)
             entries = parse_index(html_text, url)
         except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
-            self._set_status(f"加载失败 {url}：{exc}", timeout=2.0)
+            self._set_status(f"加载失败 {display_url}：{exc}", timeout=2.0)
             return False
         if push and self.stack is not None:
             self.stack.push(url, entries)
@@ -456,13 +462,14 @@ class BrowserApp:
 
     def _refresh_current(self) -> None:
         frame = self.stack.current
-        self._set_status(f"正在刷新 {frame.url} ...")
+        display_url = urllib.parse.unquote(frame.url)
+        self._set_status(f"正在刷新 {display_url} ...")
         self._draw()
         try:
             html_text = fetch_index(frame.url)
             entries = parse_index(html_text, frame.url)
         except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
-            self._set_status(f"刷新失败 {frame.url}：{exc}", timeout=2.0)
+            self._set_status(f"刷新失败 {display_url}：{exc}", timeout=2.0)
             return
         frame.entries = entries
         if frame.entries:
@@ -581,8 +588,8 @@ class BrowserApp:
             return
 
         frame = self.stack.current
-        breadcrumb = _truncate(frame.url, width - 1)
-        self.stdscr.addstr(0, 0, breadcrumb, curses.A_REVERSE)
+        breadcrumb = _truncate(urllib.parse.unquote(frame.url), width - 1)
+        self.stdscr.addstr(0, 0, breadcrumb, self.header_attr)
 
         size_width, mtime_width = 8, 16
         name_width = max(width - size_width - mtime_width - 3, 8)

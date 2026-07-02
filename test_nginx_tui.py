@@ -385,6 +385,50 @@ class TestConfirmOverwrite(unittest.TestCase):
         self.assertFalse(result)
 
 
+class TestBreadcrumbDisplay(unittest.TestCase):
+    def test_breadcrumb_shows_percent_decoded_url(self):
+        class _RecordingStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = []
+
+            def addstr(self, *args, **kwargs):
+                self.calls.append(args)
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_RecordingStdScr(), "http://x/%E4%B8%AD%E6%96%87/", "/tmp")
+            app.stdscr.calls.clear()
+            app._draw()
+        breadcrumb_call = app.stdscr.calls[0]
+        self.assertEqual(breadcrumb_call[2], "http://x/中文/")
+
+    def test_header_attr_falls_back_to_reverse_without_color_support(self):
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+        self.assertEqual(app.header_attr, curses.A_REVERSE | curses.A_BOLD)
+
+    def test_header_attr_uses_fixed_white_on_blue_pair_with_color_support(self):
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=True), \
+            unittest.mock.patch("nginx_tui.curses.start_color"), \
+            unittest.mock.patch("nginx_tui.curses.use_default_colors"), \
+            unittest.mock.patch("nginx_tui.curses.init_pair") as init_pair_mock, \
+            unittest.mock.patch("nginx_tui.curses.color_pair", side_effect=lambda n: n * 100), \
+            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+        init_pair_mock.assert_any_call(2, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        self.assertEqual(app.header_attr, 200 | curses.A_BOLD)
+
+
 class TestDrawResilience(unittest.TestCase):
     def test_curses_error_during_draw_does_not_propagate(self):
         class _FailingStdScr(_FakeStdScr):
