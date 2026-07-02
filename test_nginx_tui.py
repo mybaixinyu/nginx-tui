@@ -20,6 +20,7 @@ from nginx_tui import (
     NavigationStack,
     _display_width,
     _format_duration,
+    _format_entry_size,
     _ssl_context,
     download_file,
     fetch_index,
@@ -118,6 +119,23 @@ class TestFormatSize(unittest.TestCase):
     def test_gigabytes(self):
         self.assertEqual(format_size(3 * 1024 ** 3), "3.0G")
 
+    def test_terabytes(self):
+        self.assertEqual(format_size(5 * 1024 ** 4), "5.0T")
+
+
+class TestFormatEntrySize(unittest.TestCase):
+    def test_uses_exact_bytes_when_known(self):
+        entry = Entry("f", "f", "http://x/f", False, 2048, None)
+        self.assertEqual(_format_entry_size(entry), "2.0K")
+
+    def test_falls_back_to_raw_text_when_only_a_rounded_size_is_known(self):
+        entry = Entry("f", "f", "http://x/f", False, None, None, size_raw="24M")
+        self.assertEqual(_format_entry_size(entry), "24M")
+
+    def test_dash_when_nothing_is_known(self):
+        entry = Entry("f", "f", "http://x/f", False, None, None)
+        self.assertEqual(_format_entry_size(entry), "-")
+
 
 class TestFormatMtime(unittest.TestCase):
     def test_none_stays_none(self):
@@ -160,10 +178,29 @@ class TestParseIndex(unittest.TestCase):
         self.assertTrue(subdir.is_dir)
         self.assertIsNone(subdir.size_bytes)
 
-    def test_unparseable_meta_degrades_gracefully(self):
+    def test_rounded_unit_size_still_yields_date_and_is_shown_as_is(self):
+        # autoindex_exact_size off renders sizes like "1.2K" instead of an
+        # exact byte count -- the date alongside it is still real and valid,
+        # and the size itself is shown as the server reported it (size_raw),
+        # not converted to a fabricated byte count.
+        # Each entry is on its own line, matching real nginx output (and
+        # required by _LINE_META_RE's per-line \s*$ anchor).
+        html_text = (
+            "<html><body><pre>\n"
+            '<a href="big.iso">big.iso</a>          06-Jul-2023 10:00          1.2K\n'
+            "</pre></body></html>"
+        )
+        entries = parse_index(html_text, "http://example.com/files/")
+        entry = entries[0]
+        self.assertEqual(entry.name, "big.iso")
+        self.assertIsNone(entry.size_bytes)
+        self.assertEqual(entry.size_raw, "1.2K")
+        self.assertEqual(entry.mtime, "2023-07-06 10:00")
+
+    def test_completely_unparseable_meta_degrades_gracefully(self):
         html_text = (
             "<html><body><pre>"
-            '<a href="weird.bin">weird.bin</a>          06-Jul-2023 10:00          1.2K'
+            '<a href="weird.bin">weird.bin</a>          not-a-date-or-size-at-all'
             "</pre></body></html>"
         )
         entries = parse_index(html_text, "http://example.com/files/")
@@ -171,6 +208,21 @@ class TestParseIndex(unittest.TestCase):
         self.assertEqual(weird.name, "weird.bin")
         self.assertIsNone(weird.size_bytes)
         self.assertIsNone(weird.mtime)
+
+    def test_genuinely_empty_directory_returns_no_entries(self):
+        # A real empty nginx directory still lists the "../" anchor.
+        html_text = '<html><body><pre><a href="../">../</a>\n</pre></body></html>'
+        entries = parse_index(html_text, "http://example.com/empty/")
+        self.assertEqual(entries, [])
+
+    def test_page_with_no_anchors_at_all_also_returns_no_entries(self):
+        # Not every server includes a "../" anchor for an empty directory
+        # (e.g. Python's http.server emits zero <a> tags for one) -- an
+        # anchor-free page can't be reliably distinguished from a genuinely
+        # empty listing, so it degrades to an empty list rather than erroring.
+        html_text = '{"error": "not found"}'
+        entries = parse_index(html_text, "http://example.com/api/")
+        self.assertEqual(entries, [])
 
 
 class _QuietHandler(http.server.SimpleHTTPRequestHandler):
@@ -199,12 +251,22 @@ class TestFetchIndex(_ServerTestCase):
     def test_fetches_and_decodes_text(self):
         with open(os.path.join(self.serve_dir, "page.html"), "w", encoding="utf-8") as f:
             f.write("<html>你好</html>")
-        result = fetch_index(self.base_url + "page.html")
-        self.assertEqual(result, "<html>你好</html>")
+        html_text, final_url = fetch_index(self.base_url + "page.html")
+        self.assertEqual(html_text, "<html>你好</html>")
+        self.assertEqual(final_url, self.base_url + "page.html")
 
     def test_raises_on_404(self):
         with self.assertRaises(urllib.error.HTTPError):
             fetch_index(self.base_url + "missing.html")
+
+    def test_returns_final_url_after_redirect(self):
+        # nginx 301-redirects a directory request missing its trailing slash;
+        # relative hrefs in the listing must resolve against the final URL.
+        os.mkdir(os.path.join(self.serve_dir, "subdir"))
+        with open(os.path.join(self.serve_dir, "subdir", "inner.txt"), "w") as f:
+            f.write("x")
+        html_text, final_url = fetch_index(self.base_url + "subdir")
+        self.assertEqual(final_url, self.base_url + "subdir/")
 
 
 class TestDownloadFile(_ServerTestCase):
@@ -312,8 +374,8 @@ class TestInsecureFlagAgainstSelfSignedServer(_HttpsServerTestCase):
     def test_fetch_index_succeeds_with_insecure_true(self):
         with open(os.path.join(self.serve_dir, "page2.html"), "w") as f:
             f.write("<html>ok</html>")
-        result = fetch_index(self.base_url + "page2.html", insecure=True)
-        self.assertEqual(result, "<html>ok</html>")
+        html_text, _final_url = fetch_index(self.base_url + "page2.html", insecure=True)
+        self.assertEqual(html_text, "<html>ok</html>")
 
     def test_download_file_succeeds_with_insecure_true(self):
         content = os.urandom(2000)
@@ -395,7 +457,7 @@ class TestRefreshCurrent(unittest.TestCase):
         with unittest.mock.patch("nginx_tui.curses.curs_set"), \
             unittest.mock.patch("nginx_tui.curses.mousemask"), \
             unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
-            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>") as fetch_mock, \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)) as fetch_mock, \
             unittest.mock.patch("nginx_tui.parse_index", return_value=refreshed_entries) as parse_mock:
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
             app.stack.current.entries = initial_entries
@@ -411,7 +473,7 @@ class TestRefreshCurrent(unittest.TestCase):
         with unittest.mock.patch("nginx_tui.curses.curs_set"), \
             unittest.mock.patch("nginx_tui.curses.mousemask"), \
             unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
-            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
             unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
             app.stack.current.entries = initial_entries
@@ -427,7 +489,7 @@ class TestLoadCancellation(unittest.TestCase):
         with unittest.mock.patch("nginx_tui.curses.curs_set"), \
             unittest.mock.patch("nginx_tui.curses.mousemask"), \
             unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
-            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
             unittest.mock.patch("nginx_tui.parse_index", return_value=parent_entries):
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
             with unittest.mock.patch("nginx_tui.fetch_index", side_effect=KeyboardInterrupt):
@@ -488,7 +550,7 @@ class TestEnterDirSelected(unittest.TestCase):
         with unittest.mock.patch("nginx_tui.curses.curs_set"), \
             unittest.mock.patch("nginx_tui.curses.mousemask"), \
             unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
-            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
             unittest.mock.patch("nginx_tui.parse_index", return_value=dir_entries):
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
             with unittest.mock.patch("nginx_tui.parse_index", return_value=child_entries):
@@ -501,7 +563,7 @@ class TestEnterDirSelected(unittest.TestCase):
         with unittest.mock.patch("nginx_tui.curses.curs_set"), \
             unittest.mock.patch("nginx_tui.curses.mousemask"), \
             unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
-            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
             unittest.mock.patch("nginx_tui.parse_index", return_value=file_entries), \
             unittest.mock.patch("nginx_tui.download_file") as download_mock:
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
@@ -519,7 +581,7 @@ class TestConfirmOverwrite(unittest.TestCase):
         with unittest.mock.patch("nginx_tui.curses.curs_set"), \
             unittest.mock.patch("nginx_tui.curses.mousemask"), \
             unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
-            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
             unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
             app.stdscr = _InterruptingStdScr()
@@ -534,7 +596,7 @@ class TestConfirmOverwrite(unittest.TestCase):
         with unittest.mock.patch("nginx_tui.curses.curs_set"), \
             unittest.mock.patch("nginx_tui.curses.mousemask"), \
             unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
-            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
             unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
             app.stdscr = _EscStdScr()
@@ -554,7 +616,7 @@ class TestBreadcrumbDisplay(unittest.TestCase):
         with unittest.mock.patch("nginx_tui.curses.curs_set"), \
             unittest.mock.patch("nginx_tui.curses.mousemask"), \
             unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
-            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
             unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
             app = BrowserApp(_RecordingStdScr(), "http://x/%E4%B8%AD%E6%96%87/", "/tmp")
             app.stdscr.calls.clear()
@@ -566,7 +628,7 @@ class TestBreadcrumbDisplay(unittest.TestCase):
         with unittest.mock.patch("nginx_tui.curses.curs_set"), \
             unittest.mock.patch("nginx_tui.curses.mousemask"), \
             unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
-            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
             unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
         self.assertEqual(app.header_attr, curses.A_REVERSE | curses.A_BOLD)
@@ -579,7 +641,7 @@ class TestBreadcrumbDisplay(unittest.TestCase):
             unittest.mock.patch("nginx_tui.curses.use_default_colors"), \
             unittest.mock.patch("nginx_tui.curses.init_pair") as init_pair_mock, \
             unittest.mock.patch("nginx_tui.curses.color_pair", side_effect=lambda n: n * 100), \
-            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
             unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
         init_pair_mock.assert_any_call(2, curses.COLOR_WHITE, curses.COLOR_BLUE)
@@ -589,7 +651,7 @@ class TestBreadcrumbDisplay(unittest.TestCase):
         with unittest.mock.patch("nginx_tui.curses.curs_set"), \
             unittest.mock.patch("nginx_tui.curses.mousemask"), \
             unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
-            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
             unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
         self.assertEqual(app.footer_attr, curses.A_BOLD)
@@ -603,7 +665,7 @@ class TestBreadcrumbDisplay(unittest.TestCase):
             unittest.mock.patch("nginx_tui.curses.use_default_colors"), \
             unittest.mock.patch("nginx_tui.curses.init_pair") as init_pair_mock, \
             unittest.mock.patch("nginx_tui.curses.color_pair", side_effect=lambda n: n * 100), \
-            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
             unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
         init_pair_mock.assert_any_call(3, curses.COLOR_CYAN, -1)
@@ -620,7 +682,7 @@ class TestBreadcrumbDisplay(unittest.TestCase):
         with unittest.mock.patch("nginx_tui.curses.curs_set"), \
             unittest.mock.patch("nginx_tui.curses.mousemask"), \
             unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
-            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
             unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
             app = BrowserApp(_RecordingStdScr(), "http://x/", "/tmp")
             app.stdscr.calls.clear()
@@ -638,7 +700,7 @@ class TestDrawResilience(unittest.TestCase):
         with unittest.mock.patch("nginx_tui.curses.curs_set"), \
             unittest.mock.patch("nginx_tui.curses.mousemask"), \
             unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
-            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
             unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
             app = BrowserApp(_FailingStdScr(), "http://x/", "/tmp")
             app._draw()  # must not raise curses.error
@@ -649,7 +711,7 @@ def _make_app_with_entries(count):
     with unittest.mock.patch("nginx_tui.curses.curs_set"), \
         unittest.mock.patch("nginx_tui.curses.mousemask"), \
         unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
-        unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+        unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
         unittest.mock.patch("nginx_tui.parse_index", return_value=entries):
         return BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
 
@@ -718,7 +780,7 @@ class TestResizeAdjustsOffset(unittest.TestCase):
         with unittest.mock.patch("nginx_tui.curses.curs_set"), \
             unittest.mock.patch("nginx_tui.curses.mousemask"), \
             unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
-            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
             unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
             app.stdscr = _ResizeThenQuitStdScr()

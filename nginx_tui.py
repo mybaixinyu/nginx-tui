@@ -74,6 +74,10 @@ class Entry:
     is_dir: bool
     size_bytes: Optional[int]
     mtime: Optional[str]
+    # Set only when the server reported a rounded, unit-suffixed size
+    # (autoindex_exact_size off, e.g. "24M") instead of an exact byte count.
+    # size_bytes stays None in that case; this is shown as-is instead.
+    size_raw: Optional[str] = None
 
 
 class _AnchorExtractor(html.parser.HTMLParser):
@@ -105,10 +109,14 @@ class _AnchorExtractor(html.parser.HTMLParser):
 
 
 # Matches nginx's default autoindex line: <a href="...">text</a>  DD-Mon-YYYY HH:MM  size
+# `size` also accepts autoindex_exact_size off's rounded K/M/G/T-suffixed
+# form (e.g. "24M") so that a large file's very real, present date isn't
+# lost just because its size isn't an exact byte count -- _parse_meta_by_href
+# still discards a unit-suffixed size rather than fabricate a byte count.
 _LINE_META_RE = re.compile(
     r'<a\s+href="(?P<href>[^"]*)"[^>]*>.*?</a>'
     r'\s*(?:(?P<date>\d{2}-[A-Za-z]{3}-\d{4}\s+\d{2}:\d{2}))?'
-    r'\s*(?P<size>-|\d+)?\s*$'
+    r'\s*(?P<size>-|\d+(?:\.\d+)?[KMGT]?)?\s*$'
 )
 
 _SKIP_HREFS = {"../", "..", "/"}
@@ -132,15 +140,20 @@ _MTIME_RE = re.compile(
 )
 
 
-def _parse_meta_by_href(html_text: str) -> Dict[str, Tuple[Optional[str], Optional[int]]]:
-    meta: Dict[str, Tuple[Optional[str], Optional[int]]] = {}
+def _parse_meta_by_href(html_text: str) -> Dict[str, Tuple[Optional[str], Optional[int], Optional[str]]]:
+    meta: Dict[str, Tuple[Optional[str], Optional[int], Optional[str]]] = {}
     for line in html_text.splitlines():
         match = _LINE_META_RE.search(line)
         if not match or match.group("href") in meta:
             continue
         size_raw = match.group("size")
-        size_bytes = int(size_raw) if size_raw and size_raw != "-" else None
-        meta[match.group("href")] = (match.group("date"), size_bytes)
+        # A unit-suffixed size (autoindex_exact_size off, e.g. "24M") is a
+        # rounded display value, not an exact byte count -- leave size_bytes
+        # unknown rather than fabricate a precise value, but still show the
+        # server's own text as-is.
+        size_bytes = int(size_raw) if size_raw and size_raw.isdigit() else None
+        size_display = size_raw if size_raw and size_bytes is None and size_raw != "-" else None
+        meta[match.group("href")] = (match.group("date"), size_bytes, size_display)
     return meta
 
 
@@ -148,11 +161,19 @@ def format_size(size_bytes: Optional[int]) -> str:
     if size_bytes is None:
         return "-"
     size = float(size_bytes)
-    for unit in ("B", "K", "M"):
+    for unit in ("B", "K", "M", "G"):
         if size < 1024:
             return f"{int(size)}B" if unit == "B" else f"{size:.1f}{unit}"
         size /= 1024
-    return f"{size:.1f}G"
+    return f"{size:.1f}T"
+
+
+def _format_entry_size(entry: Entry) -> str:
+    if entry.size_bytes is not None:
+        return format_size(entry.size_bytes)
+    if entry.size_raw:
+        return entry.size_raw
+    return "-"
 
 
 def _format_duration(seconds: float) -> str:
@@ -194,7 +215,7 @@ def parse_index(html_text: str, base_url: str) -> List[Entry]:
             continue
         seen.add(href)
         is_dir = href.endswith("/")
-        date_raw, size_bytes = meta_by_href.get(href, (None, None))
+        date_raw, size_bytes, size_raw = meta_by_href.get(href, (None, None, None))
         entries.append(Entry(
             name=urllib.parse.unquote(href),
             href=href,
@@ -202,6 +223,7 @@ def parse_index(html_text: str, base_url: str) -> List[Entry]:
             is_dir=is_dir,
             size_bytes=None if is_dir else size_bytes,
             mtime=format_mtime(date_raw),
+            size_raw=None if is_dir else size_raw,
         ))
     return entries
 
@@ -215,11 +237,15 @@ def _ssl_context(insecure: bool) -> Optional[ssl.SSLContext]:
     return context
 
 
-def fetch_index(url: str, timeout: float = CONNECT_TIMEOUT, insecure: bool = False) -> str:
+def fetch_index(url: str, timeout: float = CONNECT_TIMEOUT, insecure: bool = False) -> Tuple[str, str]:
+    # Returns (html, final_url): nginx 301-redirects a directory request that's
+    # missing its trailing slash, and relative hrefs in the listing must be
+    # resolved against that final URL, not the one originally requested.
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context(insecure)) as response:
         charset = response.headers.get_content_charset() or "utf-8"
-        return response.read().decode(charset, errors="replace")
+        html_text = response.read().decode(charset, errors="replace")
+        return html_text, response.geturl()
 
 
 def download_file(
@@ -231,12 +257,14 @@ def download_file(
 ) -> None:
     part_path = dest_path + ".part"
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    opened_part = False
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context(insecure)) as response:
             total_header = response.headers.get("Content-Length")
             total_bytes = int(total_header) if total_header is not None else None
             downloaded = 0
             with open(part_path, "wb") as out_file:
+                opened_part = True
                 while True:
                     chunk = response.read(CHUNK_SIZE)
                     if not chunk:
@@ -247,7 +275,10 @@ def download_file(
                         progress_cb(downloaded, total_bytes)
         os.replace(part_path, dest_path)
     except BaseException:
-        if os.path.exists(part_path):
+        # Only remove part_path if this call actually created/truncated it --
+        # never delete a pre-existing file we never touched (e.g. the request
+        # itself failed before open() ran).
+        if opened_part and os.path.exists(part_path):
             os.remove(part_path)
         raise
 
@@ -366,7 +397,10 @@ class BrowserApp:
         self.header_attr = curses.A_REVERSE | curses.A_BOLD
         self.footer_attr = curses.A_BOLD
         self._init_colors()
-        curses.curs_set(0)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS)
         except curses.error:
@@ -396,26 +430,33 @@ class BrowserApp:
     def _init_colors(self) -> None:
         if not curses.has_colors():
             return
-        curses.start_color()
-        curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_BLUE, -1)
-        self.dir_attr = curses.color_pair(1) | curses.A_BOLD
-        # Fixed white-on-blue instead of A_REVERSE on the terminal's default
-        # colors, which can render low-contrast in some dark color schemes.
-        curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE)
-        self.header_attr = curses.color_pair(2) | curses.A_BOLD
-        # Bold cyan instead of A_DIM for the footer hint — dimming reduces
-        # contrast further and can render unreadable on dark color schemes.
-        curses.init_pair(3, curses.COLOR_CYAN, -1)
-        self.footer_attr = curses.color_pair(3) | curses.A_BOLD
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_BLUE, -1)
+            self.dir_attr = curses.color_pair(1) | curses.A_BOLD
+            # Fixed white-on-blue instead of A_REVERSE on the terminal's
+            # default colors, which can render low-contrast in some dark
+            # color schemes.
+            curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE)
+            self.header_attr = curses.color_pair(2) | curses.A_BOLD
+            # Bold cyan instead of A_DIM for the footer hint — dimming
+            # reduces contrast further and can render unreadable on dark
+            # color schemes.
+            curses.init_pair(3, curses.COLOR_CYAN, -1)
+            self.footer_attr = curses.color_pair(3) | curses.A_BOLD
+        except curses.error:
+            # A terminal that claims color support but can't actually set up
+            # these pairs falls back to the plain attributes set in __init__.
+            pass
 
     def _load(self, url: str, push: bool) -> bool:
         display_url = urllib.parse.unquote(url)
         self._set_status(f"正在加载 {display_url} ...{_CANCEL_HINT}")
-        self._draw()
         try:
-            html_text = fetch_index(url, insecure=self.insecure)
-            entries = parse_index(html_text, url)
+            self._draw()
+            html_text, final_url = fetch_index(url, insecure=self.insecure)
+            entries = parse_index(html_text, final_url)
         except KeyboardInterrupt:
             # Cancelling a load never pushed a new frame, so the caller is
             # left showing whatever was already on screen (the parent level
@@ -426,9 +467,9 @@ class BrowserApp:
             self._set_status(f"加载失败 {display_url}：{exc}", timeout=2.0)
             return False
         if push and self.stack is not None:
-            self.stack.push(url, entries)
+            self.stack.push(final_url, entries)
         else:
-            self.stack = NavigationStack(url, entries)
+            self.stack = NavigationStack(final_url, entries)
         self._clear_status()
         return True
 
@@ -440,7 +481,7 @@ class BrowserApp:
                 continue
             if key == curses.KEY_RESIZE:
                 if self.stack is not None:
-                    self._adjust_offset()
+                    self._clamp_viewport()
                 continue
             if self.stack is None:
                 if resolve_action(key) == Action.QUIT:
@@ -506,18 +547,40 @@ class BrowserApp:
         elif frame.selected >= frame.offset + visible:
             frame.offset = frame.selected - visible + 1
 
+    def _clamp_viewport(self) -> None:
+        # Fully re-validates selected/offset against the current frame's
+        # entry count and page size -- unlike _adjust_offset() (which only
+        # ever nudges offset towards an already-known-good selected), this
+        # also pulls offset back down when it's scrolled past where the
+        # entry count / page size would leave blank rows at the bottom.
+        # Needed anywhere selected/offset can go stale relative to entries
+        # or page size out from under a single-line move: refresh shrinking
+        # the list, a resize, or restoring a frame via _go_back.
+        frame = self.stack.current
+        if frame.entries:
+            frame.selected = max(0, min(len(frame.entries) - 1, frame.selected))
+        else:
+            frame.selected = 0
+        visible = self._page_size()
+        max_offset = max(len(frame.entries) - visible, 0)
+        frame.offset = max(0, min(max_offset, frame.offset))
+        self._adjust_offset()
+        frame.offset = max(0, min(max_offset, frame.offset))
+
     def _go_back(self) -> None:
         if not self.stack.pop():
             self._set_status("已在根目录", timeout=1.5)
+            return
+        self._clamp_viewport()
 
     def _refresh_current(self) -> None:
         frame = self.stack.current
         display_url = urllib.parse.unquote(frame.url)
         self._set_status(f"正在刷新 {display_url} ...{_CANCEL_HINT}")
-        self._draw()
         try:
-            html_text = fetch_index(frame.url, insecure=self.insecure)
-            entries = parse_index(html_text, frame.url)
+            self._draw()
+            html_text, final_url = fetch_index(frame.url, insecure=self.insecure)
+            entries = parse_index(html_text, final_url)
         except KeyboardInterrupt:
             # frame.entries is untouched, so the current (stale) listing stays visible.
             self._set_status(f"已取消刷新 {display_url}", timeout=2.0)
@@ -525,13 +588,9 @@ class BrowserApp:
         except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
             self._set_status(f"刷新失败 {display_url}：{exc}", timeout=2.0)
             return
+        frame.url = final_url
         frame.entries = entries
-        if frame.entries:
-            frame.selected = min(frame.selected, len(frame.entries) - 1)
-        else:
-            frame.selected = 0
-        frame.offset = min(frame.offset, frame.selected)
-        self._adjust_offset()
+        self._clamp_viewport()
         self._clear_status()
 
     def _handle_mouse(self) -> None:
@@ -570,7 +629,11 @@ class BrowserApp:
 
     def _download(self, entry: Entry) -> None:
         # basename() guards against path traversal via a crafted href
-        dest_path = os.path.join(self.output_dir, os.path.basename(entry.name))
+        basename = os.path.basename(entry.name)
+        if not basename or basename in (".", ".."):
+            self._set_status(f"无法下载：文件名无效（{entry.name!r}）", timeout=2.0)
+            return
+        dest_path = os.path.join(self.output_dir, basename)
         if os.path.exists(dest_path):
             if not self._confirm_overwrite(dest_path):
                 self._set_status("已取消下载", timeout=1.5)
@@ -615,13 +678,23 @@ class BrowserApp:
 
     def _confirm_overwrite(self, dest_path: str) -> bool:
         self._set_status(f"{os.path.basename(dest_path)} 已存在，是否覆盖？(y/n)")
-        self._draw()
+        try:
+            self._draw()
+        except KeyboardInterrupt:
+            return False
         while True:
             try:
                 key = self.stdscr.getch()
             except KeyboardInterrupt:
                 return False
             if key == -1:
+                continue
+            if key == curses.KEY_RESIZE:
+                # Not a keyboard answer -- redraw for the new size and keep waiting.
+                self._draw()
+                continue
+            if key == curses.KEY_MOUSE:
+                # Not a keyboard answer either (mouse move/click while confirming).
                 continue
             return key in (ord("y"), ord("Y"))
 
@@ -661,7 +734,7 @@ class BrowserApp:
         for row, entry in enumerate(frame.entries[frame.offset: frame.offset + visible]):
             y = row + 2
             name_col = format_row(entry, name_width)
-            size_col = _rjust(format_size(entry.size_bytes), size_width)
+            size_col = _rjust(_format_entry_size(entry), size_width)
             mtime_col = _rjust(entry.mtime or "", mtime_width)
             line = f"{name_col} {size_col} {mtime_col}"
             attr = curses.A_REVERSE if frame.offset + row == frame.selected else curses.A_NORMAL
@@ -671,7 +744,7 @@ class BrowserApp:
 
         status = (
             "↑/↓/j/k 移动  PgUp/PgDn 翻页  Enter/点击 进入或下载  → 进入目录  "
-            "r/R/F5 刷新  Backspace/←/u/Esc 返回上级  q 退出"
+            "r/R/F5 刷新  Backspace/←/u/Esc 返回上级  q/Q 退出"
         )
         shown_status = _truncate(status, width - 1)
         self.stdscr.addstr(height - 1, 0, shown_status, self.footer_attr)
@@ -695,7 +768,12 @@ class BrowserApp:
 def main(argv: Optional[List[str]] = None) -> None:
     # Must run before curses.wrapper()/initscr() so the window's encoding
     # resolves to the process locale (needed for the Chinese UI text to render).
-    locale.setlocale(locale.LC_ALL, "")
+    # An unsupported locale isn't fatal -- it just risks mis-rendered wide
+    # characters, so degrade instead of crashing before --help even runs.
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
     # ncurses waits ESCDELAY ms after a lone Esc byte before delivering it,
     # in case more bytes are coming (arrow/function keys are also Esc-prefixed
     # sequences); the 1000ms default makes Esc-to-go-back feel laggy. Only
