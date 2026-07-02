@@ -405,6 +405,58 @@ class TestRefreshCurrent(unittest.TestCase):
         self.assertEqual(app.stack.current.entries, refreshed_entries)
         self.assertEqual(app.stack.current.selected, 0)
 
+    def test_keyboard_interrupt_cancels_without_losing_current_listing(self):
+        initial_entries = [Entry("old.txt", "old.txt", "http://x/old.txt", False, 1, None)]
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            app.stack.current.entries = initial_entries
+            with unittest.mock.patch("nginx_tui.fetch_index", side_effect=KeyboardInterrupt):
+                app._refresh_current()  # must not raise
+        self.assertEqual(app.stack.current.entries, initial_entries)
+        self.assertIn("已取消刷新", app.status)
+
+
+class TestLoadCancellation(unittest.TestCase):
+    def test_keyboard_interrupt_while_entering_a_subdirectory_stays_at_parent(self):
+        parent_entries = [Entry("subdir/", "subdir/", "http://x/subdir/", True, None, None)]
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", return_value="<html></html>"), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=parent_entries):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            with unittest.mock.patch("nginx_tui.fetch_index", side_effect=KeyboardInterrupt):
+                result = app._load("http://x/subdir/", push=True)  # must not raise
+        self.assertFalse(result)
+        self.assertIn("已取消加载", app.status)
+        # No new frame was pushed -- still showing the parent listing.
+        self.assertEqual(app.stack.current.url, "http://x/")
+        self.assertEqual(app.stack.current.entries, parent_entries)
+        self.assertTrue(app.stack.at_root())
+
+    def test_keyboard_interrupt_during_startup_load_leaves_stack_none(self):
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=KeyboardInterrupt):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")  # must not raise
+        self.assertIsNone(app.stack)
+        self.assertIn("已取消加载", app.status)
+
+
+class TestFormatProgressCancelHint(unittest.TestCase):
+    def test_includes_cancel_hint_with_known_total(self):
+        text = BrowserApp._format_progress("f.zip", 50, 100)
+        self.assertIn("Ctrl-C", text)
+
+    def test_includes_cancel_hint_without_known_total(self):
+        text = BrowserApp._format_progress("f.zip", 50, None)
+        self.assertIn("Ctrl-C", text)
+
 
 class TestEnterDirSelected(unittest.TestCase):
     def test_enters_directory(self):

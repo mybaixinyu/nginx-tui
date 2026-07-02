@@ -22,6 +22,7 @@ CHUNK_SIZE = 65536
 CONNECT_TIMEOUT = 15.0
 PROGRESS_THROTTLE_SECONDS = 0.1
 _USER_AGENT = "nginx-tui/1.0"
+_CANCEL_HINT = "（Ctrl-C 取消）"
 
 
 _SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
@@ -404,11 +405,17 @@ class BrowserApp:
 
     def _load(self, url: str, push: bool) -> bool:
         display_url = urllib.parse.unquote(url)
-        self._set_status(f"正在加载 {display_url} ...")
+        self._set_status(f"正在加载 {display_url} ...{_CANCEL_HINT}")
         self._draw()
         try:
             html_text = fetch_index(url, insecure=self.insecure)
             entries = parse_index(html_text, url)
+        except KeyboardInterrupt:
+            # Cancelling a load never pushed a new frame, so the caller is
+            # left showing whatever was already on screen (the parent level
+            # when entering a subdirectory, or nothing yet at startup).
+            self._set_status(f"已取消加载 {display_url}", timeout=2.0)
+            return False
         except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
             self._set_status(f"加载失败 {display_url}：{exc}", timeout=2.0)
             return False
@@ -484,11 +491,15 @@ class BrowserApp:
     def _refresh_current(self) -> None:
         frame = self.stack.current
         display_url = urllib.parse.unquote(frame.url)
-        self._set_status(f"正在刷新 {display_url} ...")
+        self._set_status(f"正在刷新 {display_url} ...{_CANCEL_HINT}")
         self._draw()
         try:
             html_text = fetch_index(frame.url, insecure=self.insecure)
             entries = parse_index(html_text, frame.url)
+        except KeyboardInterrupt:
+            # frame.entries is untouched, so the current (stale) listing stays visible.
+            self._set_status(f"已取消刷新 {display_url}", timeout=2.0)
+            return
         except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
             self._set_status(f"刷新失败 {display_url}：{exc}", timeout=2.0)
             return
@@ -570,8 +581,8 @@ class BrowserApp:
             bar_width = 20
             filled = int(bar_width * downloaded / total)
             bar = "=" * filled + "-" * (bar_width - filled)
-            return f"下载中 {name} [{bar}] {percent}% {format_size(downloaded)}/{format_size(total)}"
-        return f"下载中 {name} {format_size(downloaded)}"
+            return f"下载中 {name} [{bar}] {percent}% {format_size(downloaded)}/{format_size(total)}{_CANCEL_HINT}"
+        return f"下载中 {name} {format_size(downloaded)}{_CANCEL_HINT}"
 
     def _confirm_overwrite(self, dest_path: str) -> bool:
         self._set_status(f"{os.path.basename(dest_path)} 已存在，是否覆盖？(y/n)")
