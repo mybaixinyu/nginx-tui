@@ -8,6 +8,7 @@ import http.client
 import locale
 import os
 import re
+import ssl
 import sys
 import time
 import unicodedata
@@ -45,6 +46,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-o", "--output-dir", default=os.getcwd(),
         help="下载文件保存的本地目录（默认：当前工作目录）",
+    )
+    parser.add_argument(
+        "-k", "--insecure", action="store_true",
+        help="跳过 HTTPS 证书校验（用于自签名证书的服务器；有中间人攻击风险，仅在信任目标网络时使用）",
     )
     return parser
 
@@ -194,9 +199,18 @@ def parse_index(html_text: str, base_url: str) -> List[Entry]:
     return entries
 
 
-def fetch_index(url: str, timeout: float = CONNECT_TIMEOUT) -> str:
+def _ssl_context(insecure: bool) -> Optional[ssl.SSLContext]:
+    if not insecure:
+        return None
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def fetch_index(url: str, timeout: float = CONNECT_TIMEOUT, insecure: bool = False) -> str:
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context(insecure)) as response:
         charset = response.headers.get_content_charset() or "utf-8"
         return response.read().decode(charset, errors="replace")
 
@@ -206,11 +220,12 @@ def download_file(
     dest_path: str,
     progress_cb: Optional[Callable[[int, Optional[int]], None]] = None,
     timeout: float = CONNECT_TIMEOUT,
+    insecure: bool = False,
 ) -> None:
     part_path = dest_path + ".part"
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context(insecure)) as response:
             total_header = response.headers.get("Content-Length")
             total_bytes = int(total_header) if total_header is not None else None
             downloaded = 0
@@ -333,9 +348,10 @@ def format_row(entry: Entry, name_width: int) -> str:
 
 
 class BrowserApp:
-    def __init__(self, stdscr, start_url: str, output_dir: str) -> None:
+    def __init__(self, stdscr, start_url: str, output_dir: str, insecure: bool = False) -> None:
         self.stdscr = stdscr
         self.output_dir = output_dir
+        self.insecure = insecure
         self.status = ""
         self.status_expires_at: Optional[float] = None
         self.stack: Optional[NavigationStack] = None
@@ -386,7 +402,7 @@ class BrowserApp:
         self._set_status(f"正在加载 {display_url} ...")
         self._draw()
         try:
-            html_text = fetch_index(url)
+            html_text = fetch_index(url, insecure=self.insecure)
             entries = parse_index(html_text, url)
         except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
             self._set_status(f"加载失败 {display_url}：{exc}", timeout=2.0)
@@ -466,7 +482,7 @@ class BrowserApp:
         self._set_status(f"正在刷新 {display_url} ...")
         self._draw()
         try:
-            html_text = fetch_index(frame.url)
+            html_text = fetch_index(frame.url, insecure=self.insecure)
             entries = parse_index(html_text, frame.url)
         except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
             self._set_status(f"刷新失败 {display_url}：{exc}", timeout=2.0)
@@ -534,7 +550,7 @@ class BrowserApp:
             self._draw()
 
         try:
-            download_file(entry.url, dest_path, progress_cb=on_progress)
+            download_file(entry.url, dest_path, progress_cb=on_progress, insecure=self.insecure)
         except KeyboardInterrupt:
             self._set_status("下载已中断", timeout=1.5)
         except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
@@ -649,7 +665,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     error_holder: List[str] = []
 
     def _run(stdscr):
-        app = BrowserApp(stdscr, args.url, args.output_dir)
+        app = BrowserApp(stdscr, args.url, args.output_dir, insecure=args.insecure)
         if app.stack is None:
             error_holder.append(app.status)
             return

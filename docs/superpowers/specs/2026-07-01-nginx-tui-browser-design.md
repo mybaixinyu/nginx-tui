@@ -17,7 +17,7 @@
 **非目标**
 - 递归下载整个目录
 - 需要登录认证（Basic Auth / Cookie）的服务器
-- 自定义 CA 证书的 HTTPS（使用系统默认 SSL 上下文即可）
+- 自定义 CA 证书的 HTTPS（默认使用系统默认 SSL 上下文；`--insecure`/`-k` 只是跳过证书校验，不做自定义 CA 信任链）
 - 排序/过滤/搜索等高级列表操作
 - 断点续传
 
@@ -29,8 +29,8 @@
   - 名称统一取 `unquote(href)`，不用链接文本——因为超长文件名 nginx 会在链接文本里截断显示（`..&gt;`），href 是完整的
   - 跳过父目录项（`href` 为 `../`、`/` 或链接文本为 `..`），返回上级由脚本自己的历史栈管理
   - 对每个 `<a>` 标签所在的原始文本行，用正则尽力解析出其后跟着的日期（`%d-%b-%Y %H:%M`）和大小（数字或 `-`），解析不到就把 `size_bytes`/`mtime` 置空，不影响该条目正常显示和下载
-- `fetch_index(url) -> str`：`urllib.request` 拉取 HTML，设超时；HTTP/网络错误交给调用方处理（不在这一层吞异常）
-- `download_file(url, dest_path, progress_cb)`：流式分块（64KB）写入 `dest_path + ".part"`，成功后 rename 成目标文件名；异常或 `KeyboardInterrupt` 时清理 `.part` 残留
+- `fetch_index(url, insecure=False) -> str`：`urllib.request` 拉取 HTML，设超时；HTTP/网络错误交给调用方处理（不在这一层吞异常）；`insecure=True` 时用不校验证书/主机名的 SSL 上下文
+- `download_file(url, dest_path, progress_cb, insecure=False)`：流式分块（64KB）写入 `dest_path + ".part"`，成功后 rename 成目标文件名；异常或 `KeyboardInterrupt` 时清理 `.part` 残留
 
 ## 导航：历史栈
 
@@ -76,10 +76,11 @@
 ## CLI 参数
 
 ```
-python3 nginx_tui.py <URL> [--output-dir DIR]
+python3 nginx_tui.py <URL> [--output-dir DIR] [--insecure]
 ```
 - `URL`：必填；缺少协议前缀（`http://`/`https://`）时自动补 `http://`
 - `--output-dir`/`-o`：可选，默认当前工作目录
+- `--insecure`/`-k`：可选，跳过 HTTPS 证书校验（用于自签名证书的服务器），默认不开启；一旦开启，加载/刷新/下载都不校验证书，有中间人攻击风险，仅应在信任目标网络时使用
 - 不带任何参数运行（`python3 nginx_tui.py`）：直接打印完整帮助信息（等价于 `--help` 的输出：用法、参数说明、示例）并退出，不是 argparse 默认的简短报错
 - `-h`/`--help`：同上，随时可查看帮助
 

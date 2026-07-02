@@ -4,6 +4,8 @@ import http.server
 import io
 import os
 import shutil
+import ssl
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -17,6 +19,7 @@ from nginx_tui import (
     Entry,
     NavigationStack,
     _display_width,
+    _ssl_context,
     download_file,
     fetch_index,
     format_mtime,
@@ -70,6 +73,16 @@ class TestParseArgs(unittest.TestCase):
     def test_output_dir_flag_is_honored(self):
         args = parse_args(["http://example.com/files/", "--output-dir", "/tmp/dl"])
         self.assertEqual(args.output_dir, "/tmp/dl")
+
+    def test_insecure_defaults_to_false(self):
+        args = parse_args(["http://example.com/files/"])
+        self.assertFalse(args.insecure)
+
+    def test_insecure_flag_is_honored(self):
+        args = parse_args(["https://example.com/files/", "--insecure"])
+        self.assertTrue(args.insecure)
+        args_short = parse_args(["https://example.com/files/", "-k"])
+        self.assertTrue(args_short.insecure)
 
     def test_output_dir_expands_tilde(self):
         with unittest.mock.patch.dict(os.environ, {"HOME": "/tmp/fake-home"}):
@@ -242,6 +255,75 @@ class TestDownloadFile(_ServerTestCase):
         with self.assertRaises(urllib.error.HTTPError):
             download_file(self.base_url + "missing.bin", dest_path)
         self.assertFalse(os.path.exists(dest_path + ".part"))
+
+
+class TestSslContext(unittest.TestCase):
+    def test_returns_none_when_not_insecure(self):
+        self.assertIsNone(_ssl_context(False))
+
+    def test_returns_permissive_context_when_insecure(self):
+        context = _ssl_context(True)
+        self.assertFalse(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_NONE)
+
+
+class _HttpsServerTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("openssl") is None:
+            raise unittest.SkipTest("openssl CLI not available to generate a self-signed test certificate")
+        cls.serve_dir = tempfile.mkdtemp()
+        cls.cert_dir = tempfile.mkdtemp()
+        cert_path = os.path.join(cls.cert_dir, "cert.pem")
+        key_path = os.path.join(cls.cert_dir, "key.pem")
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", key_path, "-out", cert_path,
+                "-days", "1", "-subj", "/CN=127.0.0.1",
+            ],
+            check=True, capture_output=True,
+        )
+        handler = functools.partial(_QuietHandler, directory=cls.serve_dir)
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(cert_path, key_path)
+        cls.server.socket = server_context.wrap_socket(cls.server.socket, server_side=True)
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        cls.base_url = f"https://127.0.0.1:{cls.server.server_port}/"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.serve_dir, ignore_errors=True)
+        shutil.rmtree(cls.cert_dir, ignore_errors=True)
+
+
+class TestInsecureFlagAgainstSelfSignedServer(_HttpsServerTestCase):
+    def test_fetch_index_rejects_self_signed_cert_by_default(self):
+        with open(os.path.join(self.serve_dir, "page.html"), "w") as f:
+            f.write("<html>ok</html>")
+        with self.assertRaises(urllib.error.URLError):
+            fetch_index(self.base_url + "page.html")
+
+    def test_fetch_index_succeeds_with_insecure_true(self):
+        with open(os.path.join(self.serve_dir, "page2.html"), "w") as f:
+            f.write("<html>ok</html>")
+        result = fetch_index(self.base_url + "page2.html", insecure=True)
+        self.assertEqual(result, "<html>ok</html>")
+
+    def test_download_file_succeeds_with_insecure_true(self):
+        content = os.urandom(2000)
+        with open(os.path.join(self.serve_dir, "blob.bin"), "wb") as f:
+            f.write(content)
+        dest_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, dest_dir, ignore_errors=True)
+        dest_path = os.path.join(dest_dir, "blob.bin")
+        download_file(self.base_url + "blob.bin", dest_path, insecure=True)
+        with open(dest_path, "rb") as f:
+            self.assertEqual(f.read(), content)
 
 
 def _make_entry(name):
