@@ -23,6 +23,11 @@ CONNECT_TIMEOUT = 15.0
 PROGRESS_THROTTLE_SECONDS = 0.1
 _USER_AGENT = "nginx-tui/1.0"
 _CANCEL_HINT = "（Ctrl-C 取消）"
+# A directory listing page is plain text with light markup -- even a huge
+# directory stays well under this. Bounds how much a URL that turns out to
+# not actually be a directory listing (misconfigured or hostile server) can
+# force into memory before fetch_index gives up on it.
+_MAX_INDEX_BODY_SIZE = 10 * 1024 * 1024
 
 
 _SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
@@ -94,6 +99,11 @@ class _AnchorExtractor(html.parser.HTMLParser):
             return
         href = dict(attrs).get("href")
         if href is not None:
+            if self._current_href is not None:
+                # A new <a> opened before the previous one closed (malformed/
+                # nested markup) -- flush the still-open outer anchor first
+                # instead of silently discarding it.
+                self.anchors.append((self._current_href, "".join(self._current_text)))
             self._current_href = href
             self._current_text = []
 
@@ -223,7 +233,7 @@ def parse_index(html_text: str, base_url: str) -> List[Entry]:
         is_dir = href.endswith("/")
         date_raw, size_bytes, size_raw = meta_by_href.get(href, (None, None, None))
         entries.append(Entry(
-            name=urllib.parse.unquote(href),
+            name=_sanitize_display_text(urllib.parse.unquote(href)),
             href=href,
             url=urllib.parse.urljoin(base_url, href),
             is_dir=is_dir,
@@ -250,7 +260,19 @@ def fetch_index(url: str, timeout: float = CONNECT_TIMEOUT, insecure: bool = Fal
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context(insecure)) as response:
         charset = response.headers.get_content_charset() or "utf-8"
-        html_text = response.read().decode(charset, errors="replace")
+        chunks = []
+        total = 0
+        while True:
+            chunk = response.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _MAX_INDEX_BODY_SIZE:
+                raise ValueError(
+                    f"目录列表页过大（超过 {_MAX_INDEX_BODY_SIZE // (1024 * 1024)}MB），可能不是目录列表"
+                )
+        html_text = b"".join(chunks).decode(charset, errors="replace")
         return html_text, response.geturl()
 
 
@@ -286,6 +308,12 @@ def download_file(
                     downloaded += len(chunk)
                     if progress_cb is not None:
                         progress_cb(downloaded, total_bytes)
+            # HTTPResponse.read() returns b"" (not an exception) when the
+            # connection closes before Content-Length bytes arrive -- without
+            # this check a dropped connection silently commits a truncated
+            # file as if the download succeeded.
+            if total_bytes is not None and downloaded != total_bytes:
+                raise OSError(f"下载不完整：已接收 {downloaded}/{total_bytes} 字节，连接可能提前断开")
         os.replace(part_path, dest_path)
     except BaseException:
         # Only remove part_path if this call actually created/truncated it --
@@ -374,6 +402,18 @@ def _display_width(text: str) -> int:
     return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
 
 
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _sanitize_display_text(text: str) -> str:
+    # Percent-decoded server data (a filename, a URL path segment) can smuggle
+    # C0 control bytes -- newline, tab, carriage return -- straight into
+    # curses addstr, which treats them as real cursor motion instead of
+    # literal characters and corrupts the layout. Replace with a visible
+    # placeholder instead.
+    return _CONTROL_CHAR_RE.sub("�", text)
+
+
 def _truncate(text: str, max_width: int) -> str:
     result = ""
     for ch in text:
@@ -412,7 +452,7 @@ def _url_label(url: str) -> str:
     # full URL, which can be arbitrarily long for deeply nested paths.
     path = urllib.parse.urlsplit(url).path.rstrip("/")
     name = urllib.parse.unquote(path.rsplit("/", 1)[-1]) if path else ""
-    return name or urllib.parse.unquote(url)
+    return _sanitize_display_text(name or urllib.parse.unquote(url))
 
 
 def _ljust(text: str, width: int) -> str:
@@ -450,6 +490,10 @@ class BrowserApp:
         self.status = ""
         self.status_expires_at: Optional[float] = None
         self.stack: Optional[NavigationStack] = None
+        # Only ever set for the startup load (push=False is exclusive to it) --
+        # lets main() tell "user cancelled with Ctrl-C" apart from "load
+        # actually failed" when deciding the process exit code.
+        self.startup_cancelled = False
         self.dir_attr = curses.A_BOLD
         self.header_attr = curses.A_REVERSE | curses.A_BOLD
         self.footer_attr = curses.A_BOLD
@@ -518,6 +562,8 @@ class BrowserApp:
             # Cancelling a load never pushed a new frame, so the caller is
             # left showing whatever was already on screen (the parent level
             # when entering a subdirectory, or nothing yet at startup).
+            if not push:
+                self.startup_cancelled = True
             self._set_status(f"已取消加载 {display_label}", timeout=2.0)
             return False
         except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
@@ -664,7 +710,12 @@ class BrowserApp:
             return
         if not (bstate & curses.BUTTON1_CLICKED or bstate & curses.BUTTON1_PRESSED):
             return
-        height, _ = self.stdscr.getmaxyx()
+        height, width = self.stdscr.getmaxyx()
+        # Mirrors _draw_unsafe's own too-small check -- when the listing
+        # isn't actually drawn (only the centered "too small" message is),
+        # there's nothing visible at these coordinates to click on.
+        if height < 4 or width < _MIN_TERMINAL_WIDTH:
+            return
         if my < 2 or my >= height - 1:
             return
         frame = self.stack.current
@@ -698,10 +749,20 @@ class BrowserApp:
             self._set_status(f"无法下载：文件名无效（{entry.name!r}）", timeout=2.0)
             return
         dest_path = os.path.join(self.output_dir, basename)
+        if os.path.isdir(dest_path):
+            # Answering the overwrite prompt "y" here would still fail at the
+            # final os.replace (IsADirectoryError) only after the full file
+            # has already been downloaded -- reject up front instead.
+            self._set_status(f"无法下载：{dest_path} 是一个目录", timeout=2.0)
+            return
+        # lexists (not exists) so a pre-existing broken symlink at dest_path
+        # still counts as "something is already there" -- exists() follows
+        # symlinks and returns False for a dangling one, which would
+        # otherwise skip the prompt entirely.
         # Also guard the ".part" staging path -- download_file truncates it
         # unconditionally, so without this check a pre-existing (unrelated)
         # "<name>.part" file would be silently destroyed with no prompt.
-        if os.path.exists(dest_path) or os.path.exists(dest_path + ".part"):
+        if os.path.lexists(dest_path) or os.path.lexists(dest_path + ".part"):
             if not self._confirm_overwrite(dest_path):
                 self._set_status("已取消下载", timeout=1.5)
                 return
@@ -806,7 +867,7 @@ class BrowserApp:
             return
 
         frame = self.stack.current
-        breadcrumb = _truncate_middle(urllib.parse.unquote(frame.url), width - 1)
+        breadcrumb = _truncate_middle(_sanitize_display_text(urllib.parse.unquote(frame.url)), width - 1)
         self.stdscr.addstr(0, 0, breadcrumb, self.header_attr)
 
         size_width, mtime_width = _SIZE_COL_WIDTH, _MTIME_COL_WIDTH
@@ -818,8 +879,12 @@ class BrowserApp:
         for row, entry in enumerate(frame.entries[frame.offset: frame.offset + visible]):
             y = row + 2
             name_col = format_row(entry, name_width)
-            size_col = _rjust(_format_entry_size(entry), size_width)
-            mtime_col = _rjust(entry.mtime or "", mtime_width)
+            # _rjust only pads, never clips -- an oversized value (e.g. a
+            # server-reported date the regex accepted but format_mtime
+            # couldn't parse, so it fell back to the raw, longer string)
+            # would otherwise overflow the column and wrap the row.
+            size_col = _rjust(_truncate(_format_entry_size(entry), size_width), size_width)
+            mtime_col = _rjust(_truncate(entry.mtime or "", mtime_width), mtime_width)
             line = f"{name_col} {size_col} {mtime_col}"
             attr = curses.A_REVERSE if frame.offset + row == frame.selected else curses.A_NORMAL
             if entry.is_dir:
@@ -830,7 +895,12 @@ class BrowserApp:
             "↑/↓/j/k 移动  PgUp/PgDn 翻页  Enter/点击 进入或下载  → 进入目录  "
             "r/R/F5 刷新  Backspace/←/u/Esc 返回上级  q/Q 退出"
         )
-        shown_status = _truncate(status, width - 1)
+        # This fixed hint is 114 columns wide -- front-truncating it (the old
+        # behavior) cut off "q/Q 退出" at every width below 115, which is
+        # effectively always. Middle-truncating keeps the movement hints at
+        # the head and the quit hint at the tail instead of losing the tail
+        # outright.
+        shown_status = _truncate_middle(status, width - 1)
         self.stdscr.addstr(height - 1, 0, shown_status, self.footer_attr)
         if self._status_visible():
             self._draw_center_message(height, width, self.status)
@@ -872,12 +942,13 @@ def main(argv: Optional[List[str]] = None) -> None:
     except OSError as exc:
         print(f"无法创建输出目录 {args.output_dir}：{exc}", file=sys.stderr)
         sys.exit(1)
-    error_holder: List[str] = []
+    startup_failure: Optional[Tuple[str, bool]] = None  # (message, was_cancelled)
 
     def _run(stdscr):
+        nonlocal startup_failure
         app = BrowserApp(stdscr, args.url, args.output_dir, insecure=args.insecure)
         if app.stack is None:
-            error_holder.append(app.status)
+            startup_failure = (app.status, app.startup_cancelled)
             return
         app.run()
 
@@ -886,9 +957,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     except KeyboardInterrupt:
         sys.exit(130)
 
-    if error_holder:
-        print(error_holder[0], file=sys.stderr)
-        sys.exit(1)
+    if startup_failure is not None:
+        message, cancelled = startup_failure
+        print(message, file=sys.stderr)
+        sys.exit(130 if cancelled else 1)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ from nginx_tui import (
     _format_duration,
     _format_entry_size,
     _MIN_TERMINAL_WIDTH,
+    _sanitize_display_text,
     _ssl_context,
     _truncate_middle,
     _url_label,
@@ -243,6 +244,40 @@ class TestParseIndex(unittest.TestCase):
         entries = parse_index(html_text, "http://example.com/api/")
         self.assertEqual(entries, [])
 
+    def test_embedded_newline_in_href_is_sanitized(self):
+        # A filename with a literal newline byte (real nginx serves this as
+        # href="evil%0Aname.txt") would otherwise reach curses addstr raw and
+        # split the row across two physical lines.
+        html_text = (
+            '<a href="../">../</a>\n'
+            '<a href="evil%0Aname.txt">evil\nname.txt</a>  06-Jul-2023 10:00  5\n'
+        )
+        entries = parse_index(html_text, "http://example.com/files/")
+        self.assertEqual(len(entries), 1)
+        self.assertNotIn("\n", entries[0].name)
+        self.assertIn("evil", entries[0].name)
+        self.assertIn("name.txt", entries[0].name)
+
+    def test_nested_anchor_flushes_the_outer_one_instead_of_dropping_it(self):
+        # Malformed/nested <a> markup used to silently discard whichever
+        # anchor opened first.
+        html_text = '<a href="outer.txt">out <a href="inner.txt">in</a></a>'
+        entries = parse_index(html_text, "http://example.com/files/")
+        names = {e.name for e in entries}
+        self.assertIn("outer.txt", names)
+        self.assertIn("inner.txt", names)
+
+
+class TestSanitizeDisplayText(unittest.TestCase):
+    def test_replaces_control_characters(self):
+        self.assertEqual(_sanitize_display_text("evil\nname.txt"), "evil�name.txt")
+
+    def test_replaces_tab_and_carriage_return(self):
+        self.assertEqual(_sanitize_display_text("a\tb\rc"), "a�b�c")
+
+    def test_leaves_normal_text_unchanged(self):
+        self.assertEqual(_sanitize_display_text("normal 文件.txt"), "normal 文件.txt")
+
 
 class _QuietHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -286,6 +321,20 @@ class TestFetchIndex(_ServerTestCase):
             f.write("x")
         html_text, final_url = fetch_index(self.base_url + "subdir")
         self.assertEqual(final_url, self.base_url + "subdir/")
+
+    def test_oversized_body_raises(self):
+        with open(os.path.join(self.serve_dir, "huge.html"), "w") as f:
+            f.write("x" * 2000)
+        with unittest.mock.patch("nginx_tui._MAX_INDEX_BODY_SIZE", 1000):
+            with self.assertRaises(ValueError):
+                fetch_index(self.base_url + "huge.html")
+
+    def test_body_under_the_cap_is_returned_normally(self):
+        with open(os.path.join(self.serve_dir, "small.html"), "w") as f:
+            f.write("<html>ok</html>")
+        with unittest.mock.patch("nginx_tui._MAX_INDEX_BODY_SIZE", 1000):
+            html_text, _ = fetch_index(self.base_url + "small.html")
+        self.assertEqual(html_text, "<html>ok</html>")
 
 
 class TestDownloadFile(_ServerTestCase):
@@ -356,6 +405,36 @@ class TestDownloadFile(_ServerTestCase):
         self.assertTrue(os.path.exists(part_path))
         with open(part_path, "rb") as f:
             self.assertEqual(f.read(), b"PRE_EXISTING_UNRELATED_DATA")
+
+
+class TestDownloadFileIncompleteTransfer(unittest.TestCase):
+    def test_connection_dropped_before_content_length_raises_and_cleans_up(self):
+        # HTTPResponse.read() returns b"" (not an exception) when the
+        # connection closes early -- without a completeness check, this used
+        # to commit the truncated bytes as if the download had succeeded.
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "10000")
+                self.end_headers()
+                self.wfile.write(b"x" * 3000)
+                self.close_connection = True
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        dest_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, dest_dir, ignore_errors=True)
+        dest_path = os.path.join(dest_dir, "out.bin")
+
+        with self.assertRaises(OSError):
+            download_file(f"http://127.0.0.1:{server.server_port}/x", dest_path)
+        self.assertFalse(os.path.exists(dest_path))
+        self.assertFalse(os.path.exists(dest_path + ".part"))
 
 
 class TestSslContext(unittest.TestCase):
@@ -550,6 +629,9 @@ class TestLoadCancellation(unittest.TestCase):
         self.assertEqual(app.stack.current.url, "http://x/")
         self.assertEqual(app.stack.current.entries, parent_entries)
         self.assertTrue(app.stack.at_root())
+        # Cancelling a subdirectory load is not the startup load -- must not
+        # be mistaken for it when main() decides the process exit code.
+        self.assertFalse(app.startup_cancelled)
 
     def test_keyboard_interrupt_during_startup_load_leaves_stack_none(self):
         with unittest.mock.patch("nginx_tui.curses.curs_set"), \
@@ -559,6 +641,7 @@ class TestLoadCancellation(unittest.TestCase):
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")  # must not raise
         self.assertIsNone(app.stack)
         self.assertIn("已取消加载", app.status)
+        self.assertTrue(app.startup_cancelled)
 
     def test_entering_a_directory_shows_its_name_not_the_full_url(self):
         entries = [Entry(
@@ -773,6 +856,48 @@ class TestDownloadOverwriteCheck(unittest.TestCase):
         confirm_mock.assert_called_once()
         download_mock.assert_not_called()
 
+    def test_existing_directory_at_dest_path_is_rejected_up_front(self):
+        # Answering "y" to an overwrite prompt here would still fail at the
+        # final os.replace (IsADirectoryError) only after downloading the
+        # whole file -- reject before spending any bandwidth on it.
+        output_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, output_dir, ignore_errors=True)
+        os.mkdir(os.path.join(output_dir, "movie.mkv"))
+        entries = [Entry("movie.mkv", "movie.mkv", "http://x/movie.mkv", False, 100, None)]
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=entries), \
+            unittest.mock.patch("nginx_tui.download_file") as download_mock:
+            app = BrowserApp(_FakeStdScr(), "http://x/", output_dir)
+            with unittest.mock.patch.object(app, "_confirm_overwrite") as confirm_mock:
+                app._activate_selected()
+        confirm_mock.assert_not_called()
+        download_mock.assert_not_called()
+        self.assertIn("是一个目录", app.status)
+
+    def test_dangling_symlink_at_dest_path_still_triggers_confirmation(self):
+        # os.path.exists follows symlinks and returns False for a broken
+        # one, which used to skip the prompt and let os.replace silently
+        # clobber it.
+        output_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, output_dir, ignore_errors=True)
+        dest_path = os.path.join(output_dir, "movie.mkv")
+        os.symlink(os.path.join(output_dir, "does_not_exist"), dest_path)
+        entries = [Entry("movie.mkv", "movie.mkv", "http://x/movie.mkv", False, 100, None)]
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=entries), \
+            unittest.mock.patch("nginx_tui.download_file") as download_mock:
+            app = BrowserApp(_FakeStdScr(), "http://x/", output_dir)
+            with unittest.mock.patch.object(app, "_confirm_overwrite", return_value=False) as confirm_mock:
+                app._activate_selected()
+        confirm_mock.assert_called_once()
+        download_mock.assert_not_called()
+
 
 class TestBreadcrumbDisplay(unittest.TestCase):
     def test_breadcrumb_shows_percent_decoded_url(self):
@@ -793,6 +918,26 @@ class TestBreadcrumbDisplay(unittest.TestCase):
             app._draw()
         breadcrumb_call = app.stdscr.calls[0]
         self.assertEqual(breadcrumb_call[2], "http://x/中文/")
+
+    def test_breadcrumb_sanitizes_control_characters(self):
+        class _RecordingStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = []
+
+            def addstr(self, *args, **kwargs):
+                self.calls.append(args)
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_RecordingStdScr(), "http://x/evil%0Adir/", "/tmp")
+            app.stdscr.calls.clear()
+            app._draw()
+        breadcrumb_call = app.stdscr.calls[0]
+        self.assertNotIn("\n", breadcrumb_call[2])
+        self.assertIn("evil", breadcrumb_call[2])
 
     def test_header_attr_falls_back_to_reverse_without_color_support(self):
         with unittest.mock.patch("nginx_tui.curses.curs_set"), \
@@ -886,6 +1031,28 @@ class TestBreadcrumbDisplay(unittest.TestCase):
         footer_call = next(c for c in app.stdscr.calls if c[0] == 23)  # height-1 for the 24x100 fake screen
         self.assertNotEqual(footer_call[3] & curses.A_DIM, curses.A_DIM)
 
+    def test_footer_hint_keeps_the_quit_key_visible(self):
+        # The full footer hint is 114 columns wide -- front-truncating it (as
+        # opposed to middle-truncating) used to cut off "q/Q 退出" at every
+        # width below 115, i.e. effectively always.
+        class _RecordingStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = []
+
+            def addstr(self, *args, **kwargs):
+                self.calls.append(args)
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_RecordingStdScr(), "http://x/", "/tmp")
+            app.stdscr.calls.clear()
+            app._draw()
+        footer_call = next(c for c in app.stdscr.calls if c[0] == 23)  # height-1 for the 24x100 fake screen
+        self.assertIn("q/Q 退出", footer_call[2])
+
 
 class TestDrawResilience(unittest.TestCase):
     def test_curses_error_during_draw_does_not_propagate(self):
@@ -900,6 +1067,36 @@ class TestDrawResilience(unittest.TestCase):
             unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
             app = BrowserApp(_FailingStdScr(), "http://x/", "/tmp")
             app._draw()  # must not raise curses.error
+
+    def test_oversized_size_and_mtime_are_clipped_to_their_columns(self):
+        # _rjust only pads, never clips -- an overlong value (e.g. a raw
+        # unparseable-month date, or an unbounded unit-suffixed size) used to
+        # overflow its column and wrap the row onto the next line.
+        entry = Entry(
+            "f.txt", "f.txt", "http://x/f.txt", False,
+            None, "06-Foo-2024 10:00",
+            size_raw="123456789012345678901234567890.5M",
+        )
+
+        class _RecordingStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = []
+
+            def addstr(self, *args, **kwargs):
+                self.calls.append(args)
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[entry]):
+            app = BrowserApp(_RecordingStdScr(), "http://x/", "/tmp")
+            app.stdscr.calls.clear()
+            app._draw()
+        row_call = next(c for c in app.stdscr.calls if "f.txt" in c[2])
+        # _FakeStdScr is 100 columns wide; the row must stay within it (with
+        # the usual 1-column margin) instead of overflowing onto the next line.
+        self.assertLessEqual(_display_width(row_call[2]), 99)
 
 
 class TestSmallTerminalMessage(unittest.TestCase):
@@ -1098,6 +1295,53 @@ class TestSmallTerminalMessage(unittest.TestCase):
         self.assertIn("窗口太小，按 q 退出", app.stdscr.calls[0][2])
 
 
+class TestHandleMouseTooSmall(unittest.TestCase):
+    def _make_app(self, stdscr, entries):
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=entries):
+            return BrowserApp(stdscr, "http://x/", "/tmp")
+
+    def test_click_is_ignored_when_terminal_too_narrow(self):
+        entries = [_make_entry("secret.txt")]
+
+        class _NarrowStdScr(_FakeStdScr):
+            def getmaxyx(self):
+                return (24, 25)  # below _MIN_TERMINAL_WIDTH -- listing not drawn
+
+        app = self._make_app(_NarrowStdScr(), entries)
+        with unittest.mock.patch(
+            "nginx_tui.curses.getmouse", return_value=(0, 0, 2, 0, curses.BUTTON1_CLICKED)
+        ), unittest.mock.patch.object(app, "_download") as download_mock:
+            app._handle_mouse()
+        download_mock.assert_not_called()
+
+    def test_click_is_ignored_when_terminal_too_short(self):
+        entries = [_make_entry("secret.txt")]
+
+        class _ShortStdScr(_FakeStdScr):
+            def getmaxyx(self):
+                return (3, 100)  # below the height floor -- listing not drawn
+
+        app = self._make_app(_ShortStdScr(), entries)
+        with unittest.mock.patch(
+            "nginx_tui.curses.getmouse", return_value=(0, 0, 2, 0, curses.BUTTON1_CLICKED)
+        ), unittest.mock.patch.object(app, "_download") as download_mock:
+            app._handle_mouse()
+        download_mock.assert_not_called()
+
+    def test_click_still_works_at_a_normal_size(self):
+        entries = [_make_entry("secret.txt")]
+        app = self._make_app(_FakeStdScr(), entries)
+        with unittest.mock.patch(
+            "nginx_tui.curses.getmouse", return_value=(0, 0, 2, 0, curses.BUTTON1_CLICKED)
+        ), unittest.mock.patch.object(app, "_download") as download_mock:
+            app._handle_mouse()
+        download_mock.assert_called_once()
+
+
 class TestDrawCenterMessage(unittest.TestCase):
     def test_long_name_status_keeps_trailing_prompt_visible(self):
         class _RecordingStdScr(_FakeStdScr):
@@ -1265,6 +1509,10 @@ class TestUrlLabel(unittest.TestCase):
     def test_root_url_falls_back_to_full_url(self):
         self.assertEqual(_url_label("http://x/"), "http://x/")
 
+    def test_sanitizes_control_characters(self):
+        self.assertNotIn("\n", _url_label("http://x/evil%0Aname/"))
+        self.assertIn("evil", _url_label("http://x/evil%0Aname/"))
+
 
 class TestMain(unittest.TestCase):
     def test_output_dir_creation_failure_exits_cleanly(self):
@@ -1295,6 +1543,35 @@ class TestMain(unittest.TestCase):
             unittest.mock.patch.dict(os.environ, {"ESCDELAY": "100"}):
             main(["http://example.com/files/"])
             self.assertEqual(os.environ.get("ESCDELAY"), "100")
+
+    def test_startup_cancel_exits_with_130_not_1(self):
+        with unittest.mock.patch("nginx_tui.locale.setlocale"), \
+            unittest.mock.patch("nginx_tui.os.makedirs"), \
+            unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=KeyboardInterrupt), \
+            unittest.mock.patch("nginx_tui.curses.wrapper", side_effect=lambda fn: fn(_FakeStdScr())):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    main(["http://example.com/files/"])
+        self.assertEqual(cm.exception.code, 130)
+        self.assertIn("已取消加载", err.getvalue())
+
+    def test_startup_network_failure_exits_with_1(self):
+        with unittest.mock.patch("nginx_tui.locale.setlocale"), \
+            unittest.mock.patch("nginx_tui.os.makedirs"), \
+            unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=OSError("boom")), \
+            unittest.mock.patch("nginx_tui.curses.wrapper", side_effect=lambda fn: fn(_FakeStdScr())):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    main(["http://example.com/files/"])
+        self.assertEqual(cm.exception.code, 1)
 
 
 class TestResolveAction(unittest.TestCase):
