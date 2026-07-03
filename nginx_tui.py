@@ -851,7 +851,10 @@ class BrowserApp:
             self._draw()
             download_file(entry.url, dest_path, progress_cb=on_progress, insecure=self.insecure)
         except KeyboardInterrupt:
-            self._set_status("下载已中断", timeout=1.5)
+            # Same wording as declining the overwrite prompt and as
+            # "已取消加载"/"已取消刷新" -- all four are the same underlying
+            # event (user-initiated cancellation), just triggered differently.
+            self._set_status("已取消下载", timeout=1.5)
         except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
             self._set_status(f"下载失败：{exc}", timeout=2.0)
         else:

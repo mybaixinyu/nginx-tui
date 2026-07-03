@@ -1070,6 +1070,26 @@ class TestDownloadStatusFeedback(unittest.TestCase):
         self.assertEqual(len(status_when_called), 1)
         self.assertIn("正在下载 movie.mkv", status_when_called[0])
 
+    def test_keyboard_interrupt_during_download_uses_the_same_wording_as_other_cancellations(self):
+        # Declining the overwrite prompt and cancelling load/refresh with
+        # Ctrl-C all say "已取消 X" -- Ctrl-C during an in-progress download
+        # used to say "下载已中断" instead, a different word for the same
+        # underlying event (user-initiated cancellation).
+        entries = [Entry("movie.mkv", "movie.mkv", "http://x/movie.mkv", False, 100, None)]
+        output_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, output_dir, ignore_errors=True)
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=entries), \
+            unittest.mock.patch("nginx_tui.download_file", side_effect=KeyboardInterrupt):
+            app = BrowserApp(_FakeStdScr(), "http://x/", output_dir)
+            app._activate_selected()  # must not raise
+
+        self.assertEqual(app.status, "已取消下载")
+
 
 class TestBreadcrumbDisplay(unittest.TestCase):
     def test_breadcrumb_shows_percent_decoded_url(self):
