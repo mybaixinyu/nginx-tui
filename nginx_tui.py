@@ -430,6 +430,18 @@ def format_row(entry: Entry, name_width: int) -> str:
     return _ljust(name, name_width)
 
 
+_SIZE_COL_WIDTH = 8
+_MTIME_COL_WIDTH = 16
+_MIN_NAME_COL_WIDTH = 8
+# Below this, the name column would be squeezed below its floor and the row
+# no longer fits -- render a centered "too small" message instead of a
+# garbled, wrapped listing. The trailing +1 reserves the same 1-column right
+# margin the breadcrumb and footer already keep (both truncate to width - 1);
+# without it, the one width where the name column sits exactly at its floor
+# would be the only row that fills the terminal edge to edge.
+_MIN_TERMINAL_WIDTH = _MIN_NAME_COL_WIDTH + 1 + _SIZE_COL_WIDTH + 1 + _MTIME_COL_WIDTH + 1
+
+
 class BrowserApp:
     def __init__(self, stdscr, start_url: str, output_dir: str, insecure: bool = False) -> None:
         self.stdscr = stdscr
@@ -776,9 +788,14 @@ class BrowserApp:
             pass
 
     def _draw_unsafe(self, height: int, width: int) -> None:
-        if height < 4 or width < 20:
-            message = _truncate("终端窗口太小", max(width - 1, 0))
-            self.stdscr.addstr(0, 0, message)
+        if height < 4 or width < _MIN_TERMINAL_WIDTH:
+            # The footer key-hint line doesn't get drawn in this branch, so
+            # fold the one useful action (quit) into the message itself --
+            # otherwise there's no way to tell what to do besides guessing.
+            # Kept short deliberately: this message is the thing shown when
+            # space is already tight, so it needs to survive truncation
+            # itself down to a much narrower width than ordinary status text.
+            self._draw_center_message(height, width, "窗口太小，按 q 退出")
             self.stdscr.refresh()
             return
 
@@ -792,8 +809,8 @@ class BrowserApp:
         breadcrumb = _truncate_middle(urllib.parse.unquote(frame.url), width - 1)
         self.stdscr.addstr(0, 0, breadcrumb, self.header_attr)
 
-        size_width, mtime_width = 8, 16
-        name_width = max(width - size_width - mtime_width - 3, 8)
+        size_width, mtime_width = _SIZE_COL_WIDTH, _MTIME_COL_WIDTH
+        name_width = max(width - size_width - mtime_width - 3, _MIN_NAME_COL_WIDTH)
         header = f"{_ljust('名称', name_width)} {_rjust('大小', size_width)} {_rjust('修改时间', mtime_width)}"
         self.stdscr.addstr(1, 0, header, curses.A_BOLD)
 

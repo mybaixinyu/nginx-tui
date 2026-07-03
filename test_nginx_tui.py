@@ -22,6 +22,7 @@ from nginx_tui import (
     _display_width,
     _format_duration,
     _format_entry_size,
+    _MIN_TERMINAL_WIDTH,
     _ssl_context,
     _truncate_middle,
     _url_label,
@@ -846,7 +847,7 @@ class TestBreadcrumbDisplay(unittest.TestCase):
                 self.calls = []
 
             def getmaxyx(self):
-                return (24, 30)
+                return (24, 40)
 
             def addstr(self, *args, **kwargs):
                 self.calls.append(args)
@@ -861,7 +862,7 @@ class TestBreadcrumbDisplay(unittest.TestCase):
             app.stdscr.calls.clear()
             app._draw()
         shown = app.stdscr.calls[0][2]
-        self.assertLessEqual(_display_width(shown), 29)
+        self.assertLessEqual(_display_width(shown), 39)
         self.assertIn("…", shown)
         self.assertTrue(shown.startswith("http://x/"))
         self.assertTrue(shown.endswith("directory/"))
@@ -899,6 +900,202 @@ class TestDrawResilience(unittest.TestCase):
             unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
             app = BrowserApp(_FailingStdScr(), "http://x/", "/tmp")
             app._draw()  # must not raise curses.error
+
+
+class TestSmallTerminalMessage(unittest.TestCase):
+    def test_message_tells_the_user_how_to_recover(self):
+        # No footer key-hint line is drawn in this branch -- if the message
+        # doesn't say what to do, the user has no way to know q still quits.
+        class _RecordingStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = []
+
+            def getmaxyx(self):
+                return (24, 25)
+
+            def addstr(self, *args, **kwargs):
+                self.calls.append(args)
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_RecordingStdScr(), "http://x/", "/tmp")
+            app.stdscr.calls.clear()
+            app._draw()
+        text = app.stdscr.calls[0][2]
+        self.assertIn("窗口太小，按 q 退出", text)
+
+    def test_message_survives_untruncated_across_the_entire_too_small_width_range(self):
+        # The message itself is drawn in the same too-narrow space it's
+        # warning about -- unlike ordinary status text, it must stay
+        # readable (not get truncated into mush) across the whole range
+        # where this branch can fire, not just at the widest end of it.
+        for width in range(23, _MIN_TERMINAL_WIDTH):
+            class _RecordingStdScr(_FakeStdScr):
+                def __init__(self, w=width):
+                    self.calls = []
+                    self._w = w
+
+                def getmaxyx(self):
+                    return (24, self._w)
+
+                def addstr(self, *args, **kwargs):
+                    self.calls.append(args)
+
+            with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+                unittest.mock.patch("nginx_tui.curses.mousemask"), \
+                unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+                unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+                unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+                app = BrowserApp(_RecordingStdScr(), "http://x/", "/tmp")
+                app.stdscr.calls.clear()
+                app._draw()
+            self.assertIn(
+                "窗口太小，按 q 退出", app.stdscr.calls[0][2],
+                f"message got truncated at width={width}",
+            )
+
+    def test_q_still_quits_while_the_terminal_is_too_small(self):
+        class _TooSmallThenQuitStdScr(_FakeStdScr):
+            def getmaxyx(self):
+                return (24, 25)  # too small to render the listing
+
+            def getch(self):
+                return ord("q")
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            app.stdscr = _TooSmallThenQuitStdScr()
+            app.run()  # must return -- q must still quit even though nothing is visibly clickable
+
+    def test_width_in_the_previously_broken_20_to_34_range_shows_centered_message(self):
+        entries = [_make_entry("f.txt")]
+
+        class _RecordingStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = []
+
+            def getmaxyx(self):
+                return (24, 25)  # inside the old broken 20-34 range
+
+            def addstr(self, *args, **kwargs):
+                self.calls.append(args)
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=entries):
+            app = BrowserApp(_RecordingStdScr(), "http://x/", "/tmp")
+            app.stdscr.calls.clear()
+            app._draw()
+        # Only the centered "too small" message is drawn -- no attempt at a
+        # squeezed name/size/mtime row that would wrap or get cut off.
+        self.assertEqual(len(app.stdscr.calls), 1)
+        y, x, text = app.stdscr.calls[0][0], app.stdscr.calls[0][1], app.stdscr.calls[0][2]
+        self.assertIn("窗口太小，按 q 退出", text)
+        self.assertGreater(y, 0)  # vertically centered, not pinned to row 0
+
+    def test_width_exactly_at_the_minimum_still_renders_the_listing(self):
+        entries = [_make_entry("f.txt")]
+
+        class _RecordingStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = []
+
+            def getmaxyx(self):
+                return (24, _MIN_TERMINAL_WIDTH)
+
+            def addstr(self, *args, **kwargs):
+                self.calls.append(args)
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=entries):
+            app = BrowserApp(_RecordingStdScr(), "http://x/", "/tmp")
+            app.stdscr.calls.clear()
+            app._draw()
+        self.assertFalse(any("太小" in c[2] for c in app.stdscr.calls if len(c) > 2))
+        self.assertTrue(any("f.txt" in c[2] for c in app.stdscr.calls if len(c) > 2))
+
+    def test_minimum_width_still_leaves_the_same_right_margin_as_breadcrumb_and_footer(self):
+        # At the floor, the name column is clamped rather than computed --
+        # confirm that clamp doesn't silently drop the 1-column margin the
+        # rest of the layout (breadcrumb, footer) always reserves.
+        entries = [_make_entry("f.txt")]
+
+        class _RecordingStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = []
+
+            def getmaxyx(self):
+                return (24, _MIN_TERMINAL_WIDTH)
+
+            def addstr(self, *args, **kwargs):
+                self.calls.append(args)
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=entries):
+            app = BrowserApp(_RecordingStdScr(), "http://x/", "/tmp")
+            app.stdscr.calls.clear()
+            app._draw()
+        row_call = next(c for c in app.stdscr.calls if "f.txt" in c[2])
+        self.assertEqual(_display_width(row_call[2]), _MIN_TERMINAL_WIDTH - 1)
+
+    def test_one_column_narrower_than_the_minimum_shows_the_message(self):
+        class _RecordingStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = []
+
+            def getmaxyx(self):
+                return (24, _MIN_TERMINAL_WIDTH - 1)
+
+            def addstr(self, *args, **kwargs):
+                self.calls.append(args)
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[_make_entry("f.txt")]):
+            app = BrowserApp(_RecordingStdScr(), "http://x/", "/tmp")
+            app.stdscr.calls.clear()
+            app._draw()
+        self.assertEqual(len(app.stdscr.calls), 1)
+        self.assertIn("窗口太小，按 q 退出", app.stdscr.calls[0][2])
+
+    def test_short_height_also_shows_centered_message(self):
+        class _RecordingStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = []
+
+            def getmaxyx(self):
+                return (3, 100)
+
+            def addstr(self, *args, **kwargs):
+                self.calls.append(args)
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_RecordingStdScr(), "http://x/", "/tmp")
+            app.stdscr.calls.clear()
+            app._draw()
+        self.assertEqual(len(app.stdscr.calls), 1)
+        self.assertIn("窗口太小，按 q 退出", app.stdscr.calls[0][2])
 
 
 class TestDrawCenterMessage(unittest.TestCase):
