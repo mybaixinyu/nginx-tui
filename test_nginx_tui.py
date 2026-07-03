@@ -20,6 +20,7 @@ from nginx_tui import (
     Entry,
     NavigationStack,
     _display_width,
+    _flush_stale_input,
     _format_duration,
     _format_entry_size,
     _MIN_TERMINAL_WIDTH,
@@ -142,6 +143,29 @@ class TestFormatEntrySize(unittest.TestCase):
         self.assertEqual(_format_entry_size(entry), "-")
 
 
+class TestFlushStaleInput(unittest.TestCase):
+    def test_does_not_raise_without_a_real_initscr(self):
+        # curses.flushinp() requires initscr() to have run first -- every
+        # test in this file builds a BrowserApp around a fake stdscr without
+        # one, so this must degrade silently rather than raise curses.error.
+        _flush_stale_input()  # must not raise
+
+
+class TestDisplayWidth(unittest.TestCase):
+    def test_ascii_counts_one_column_per_character(self):
+        self.assertEqual(_display_width("abc"), 3)
+
+    def test_east_asian_wide_characters_count_two_columns(self):
+        self.assertEqual(_display_width("中文"), 4)
+
+    def test_combining_mark_adds_no_width(self):
+        # NFD-decomposed "e" + COMBINING ACUTE ACCENT renders as one visual
+        # column on a real terminal -- counting it as two overcounts and
+        # under-pads the column (safe direction), but is still wrong.
+        decomposed = "é"
+        self.assertEqual(_display_width(decomposed), 1)
+
+
 class TestFormatMtime(unittest.TestCase):
     def test_none_stays_none(self):
         self.assertIsNone(format_mtime(None))
@@ -158,6 +182,12 @@ class TestFormatMtime(unittest.TestCase):
     def test_calendrically_invalid_date_falls_back_to_raw(self):
         # Matches the day/month/year/hour/minute shape but Feb never has 31 days.
         self.assertEqual(format_mtime("31-Feb-2024 10:00"), "31-Feb-2024 10:00")
+
+    def test_unrecognized_month_fallback_sanitizes_embedded_control_characters(self):
+        # _LINE_META_RE's \s+ between date and time matches a literal tab --
+        # every fallback branch returns this raw string verbatim, so it must
+        # be sanitized before curses ever sees it, not just the happy path.
+        self.assertEqual(format_mtime("06-Foo-2023\t10:00"), "06-Foo-2023�10:00")
 
 
 class TestParseIndex(unittest.TestCase):
@@ -266,6 +296,18 @@ class TestParseIndex(unittest.TestCase):
         names = {e.name for e in entries}
         self.assertIn("outer.txt", names)
         self.assertIn("inner.txt", names)
+
+    def test_double_escaped_ampersand_in_href_still_matches_its_meta(self):
+        # HTMLParser entity-decodes attribute values once ("&amp;amp;" ->
+        # "&amp;"), but the meta regex reads the raw text -- without
+        # unescaping the regex's own href capture the same way, the two
+        # would use different dict keys and size/mtime would go missing.
+        html_text = '<a href="a&amp;amp;b.txt">a&amp;amp;b.txt</a> 06-Jul-2023 10:00 123\n'
+        entries = parse_index(html_text, "http://example.com/files/")
+        entry = entries[0]
+        self.assertEqual(entry.name, "a&amp;b.txt")
+        self.assertEqual(entry.size_bytes, 123)
+        self.assertEqual(entry.mtime, "2023-07-06 10:00")
 
 
 class TestSanitizeDisplayText(unittest.TestCase):
@@ -435,6 +477,33 @@ class TestDownloadFileIncompleteTransfer(unittest.TestCase):
             download_file(f"http://127.0.0.1:{server.server_port}/x", dest_path)
         self.assertFalse(os.path.exists(dest_path))
         self.assertFalse(os.path.exists(dest_path + ".part"))
+
+    def test_negative_content_length_is_treated_as_unknown_not_incomplete(self):
+        # int("-1") succeeds, so a malformed negative Content-Length used to
+        # sail past the "is not None" guard and make a fully-received
+        # download fail the completeness check (downloaded != -1 is always
+        # true), deleting the file it had just finished writing correctly.
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "-1")
+                self.end_headers()
+                self.wfile.write(b"complete payload")
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        dest_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, dest_dir, ignore_errors=True)
+        dest_path = os.path.join(dest_dir, "out.bin")
+
+        download_file(f"http://127.0.0.1:{server.server_port}/x", dest_path)
+        with open(dest_path, "rb") as f:
+            self.assertEqual(f.read(), b"complete payload")
 
 
 class TestSslContext(unittest.TestCase):
@@ -660,6 +729,18 @@ class TestLoadCancellation(unittest.TestCase):
         self.assertIn("subdir/", app.status)
         self.assertNotIn("http://x/a/b/c/d/e/f/g/h", app.status)
 
+    def test_exception_text_landing_in_status_is_sanitized(self):
+        # HTTP reason phrases legally allow a literal tab (RFC 9112's
+        # reason-phrase grammar includes HTAB) -- str(exc) can carry it
+        # straight into the status message unless _set_status sanitizes.
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=OSError("boom\tsplat")):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+        self.assertNotIn("\t", app.status)
+        self.assertIn("boom�splat", app.status)
+
 
 class TestFormatDuration(unittest.TestCase):
     def test_under_a_minute(self):
@@ -773,6 +854,43 @@ class TestConfirmOverwrite(unittest.TestCase):
                 result = app._confirm_overwrite("/tmp/dl/existing.txt")
         getmouse_mock.assert_called_once()
         self.assertFalse(result)
+
+    def test_prompt_wording_when_the_destination_file_itself_exists(self):
+        dest_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, dest_dir, ignore_errors=True)
+        dest_path = os.path.join(dest_dir, "movie.mkv")
+        with open(dest_path, "wb"):
+            pass
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            app._confirm_overwrite(dest_path)  # default fake getch() answers "q" -> cancel
+        self.assertIn("movie.mkv 已存在", app.status)
+        self.assertNotIn(".part", app.status)
+
+    def test_prompt_wording_when_only_the_part_file_exists(self):
+        # The caller only triggers this when dest_path OR dest_path+".part"
+        # exists -- if it's only the ".part" staging file, "movie.mkv 已存在"
+        # is misleading since movie.mkv itself isn't actually there yet.
+        dest_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, dest_dir, ignore_errors=True)
+        dest_path = os.path.join(dest_dir, "movie.mkv")
+        with open(dest_path + ".part", "wb"):
+            pass
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            app._confirm_overwrite(dest_path)  # default fake getch() answers "q" -> cancel
+        self.assertNotIn("movie.mkv 已存在", app.status)
+        self.assertIn(".part", app.status)
 
     def test_resize_during_prompt_clamps_viewport(self):
         entries = [_make_entry(f"f{i}.txt") for i in range(100)]
@@ -1472,6 +1590,30 @@ class TestRunLoopIgnoresIdleCtrlC(unittest.TestCase):
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
             app.stdscr = _InterruptThenQuitStdScr()
             app.run()  # must not raise / propagate KeyboardInterrupt
+        self.assertEqual(app.stdscr.calls, 2)
+
+    def test_keyboard_interrupt_during_action_dispatch_does_not_exit(self):
+        # The try used to wrap only _draw()+getch() -- a Ctrl-C landing while
+        # a plain navigation action (move/page/back, none of which have their
+        # own KeyboardInterrupt handling) was executing would propagate
+        # straight out of run() and kill the whole app.
+        class _MoveThenQuitStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = 0
+
+            def getch(self):
+                self.calls += 1
+                return ord("j") if self.calls == 1 else ord("q")
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            app.stdscr = _MoveThenQuitStdScr()
+            with unittest.mock.patch.object(app, "_move_selection", side_effect=KeyboardInterrupt):
+                app.run()  # must not raise / propagate KeyboardInterrupt
         self.assertEqual(app.stdscr.calls, 2)
 
 

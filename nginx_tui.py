@@ -163,7 +163,11 @@ def _parse_meta_by_href(html_text: str) -> Dict[str, Tuple[Optional[str], Option
         # server's own text as-is.
         size_bytes = int(size_raw) if size_raw and size_raw.isdigit() else None
         size_display = size_raw if size_raw and size_bytes is None and size_raw != "-" else None
-        meta[match.group("href")] = (match.group("date"), size_bytes, size_display)
+        # _AnchorExtractor's href comes from HTMLParser, which entity-decodes
+        # attribute values -- match that here so a page whose hrefs contain
+        # entities (e.g. "a&amp;b.txt") looks up under the same key instead
+        # of silently missing its size/mtime.
+        meta[html.unescape(match.group("href"))] = (match.group("date"), size_bytes, size_display)
     return meta
 
 
@@ -195,6 +199,11 @@ def _format_duration(seconds: float) -> str:
 def format_mtime(raw: Optional[str]) -> Optional[str]:
     if raw is None:
         return None
+    # The regex's \s+ between date and time matches a literal tab, which
+    # survives into every fallback return below (unrecognized month,
+    # non-calendar date) -- sanitize before those can reach curses addstr
+    # unsanitized like the other server-controlled display strings.
+    raw = _sanitize_display_text(raw)
     match = _MTIME_RE.match(raw)
     if not match:
         return raw
@@ -290,6 +299,11 @@ def download_file(
         with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context(insecure)) as response:
             total_header = response.headers.get("Content-Length")
             total_bytes = int(total_header) if total_header is not None else None
+            if total_bytes is not None and total_bytes < 0:
+                # A malformed negative value isn't a real byte count -- treat
+                # it as unknown, or the completeness check below would flag
+                # every successful download as incomplete and delete it.
+                total_bytes = None
             downloaded = 0
             with open(part_path, "wb") as out_file:
                 # Only set once open() has actually succeeded -- a failed
@@ -398,8 +412,13 @@ def resolve_action(key: int) -> Optional[Action]:
 
 
 def _display_width(text: str) -> int:
-    """Terminal column width: East-Asian wide/fullwidth characters count as 2."""
-    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+    """Terminal column width: East-Asian wide/fullwidth chars count 2, combining marks 0."""
+    width = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
 
 
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -412,6 +431,19 @@ def _sanitize_display_text(text: str) -> str:
     # literal characters and corrupts the layout. Replace with a visible
     # placeholder instead.
     return _CONTROL_CHAR_RE.sub("�", text)
+
+
+def _flush_stale_input() -> None:
+    # Keystrokes/clicks made during a blocking load/refresh/download sit in
+    # the input queue and otherwise get "replayed" against the just-drawn
+    # screen the moment it returns -- e.g. a stray click landing on whatever
+    # entry now happens to be under those coordinates. curses.flushinp()
+    # requires initscr() to have run first, which unit tests building a
+    # BrowserApp around a fake stdscr never do -- degrade silently there.
+    try:
+        curses.flushinp()
+    except curses.error:
+        pass
 
 
 def _truncate(text: str, max_width: int) -> str:
@@ -511,7 +543,10 @@ class BrowserApp:
         self._load(start_url, push=False)
 
     def _set_status(self, text: str, timeout: Optional[float] = None) -> None:
-        self.status = text
+        # Exception text (e.g. an HTTPError's reason phrase) can carry a
+        # server-controlled literal control character straight through --
+        # sanitize at this single choke point rather than at every call site.
+        self.status = _sanitize_display_text(text)
         self.status_expires_at = None if timeout is None else time.monotonic() + timeout
 
     def _clear_status(self) -> None:
@@ -565,10 +600,13 @@ class BrowserApp:
             if not push:
                 self.startup_cancelled = True
             self._set_status(f"已取消加载 {display_label}", timeout=2.0)
+            _flush_stale_input()
             return False
         except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
             self._set_status(f"加载失败 {display_label}：{exc}", timeout=2.0)
+            _flush_stale_input()
             return False
+        _flush_stale_input()
         if push and self.stack is not None:
             self.stack.push(final_url, entries)
         else:
@@ -581,46 +619,50 @@ class BrowserApp:
             try:
                 self._draw()
                 key = self.stdscr.getch()
+                # The try covers dispatch too, not just draw+getch: load/
+                # refresh/download/confirm each already handle their own
+                # Ctrl-C internally and never raise out of here, so widening
+                # this only closes the gap for the plain navigation calls
+                # below (move/page/back), which had no protection at all.
+                if key == -1:
+                    continue
+                if key == curses.KEY_RESIZE:
+                    if self.stack is not None:
+                        self._clamp_viewport()
+                    continue
+                if self.stack is None:
+                    if resolve_action(key) == Action.QUIT:
+                        return
+                    continue
+                if key == curses.KEY_MOUSE:
+                    self._handle_mouse()
+                    continue
+                action = resolve_action(key)
+                if action is None:
+                    continue
+                if action == Action.QUIT:
+                    return
+                elif action == Action.MOVE_UP:
+                    self._move_selection(-1)
+                elif action == Action.MOVE_DOWN:
+                    self._move_selection(1)
+                elif action == Action.PAGE_UP:
+                    self._page_move(-1)
+                elif action == Action.PAGE_DOWN:
+                    self._page_move(1)
+                elif action == Action.REFRESH:
+                    self._refresh_current()
+                elif action == Action.BACK:
+                    self._go_back()
+                elif action == Action.ACTIVATE:
+                    self._activate_selected()
+                elif action == Action.ENTER_DIR:
+                    self._enter_dir_selected()
             except KeyboardInterrupt:
                 # Idle browsing has no in-flight operation for Ctrl-C to
-                # cancel (unlike load/refresh/download/confirm, which each
-                # handle it themselves) -- ignore it rather than letting it
-                # fall through to main()'s handler and kill the whole TUI.
+                # cancel -- ignore it rather than letting it fall through to
+                # main()'s handler and kill the whole TUI.
                 continue
-            if key == -1:
-                continue
-            if key == curses.KEY_RESIZE:
-                if self.stack is not None:
-                    self._clamp_viewport()
-                continue
-            if self.stack is None:
-                if resolve_action(key) == Action.QUIT:
-                    return
-                continue
-            if key == curses.KEY_MOUSE:
-                self._handle_mouse()
-                continue
-            action = resolve_action(key)
-            if action is None:
-                continue
-            if action == Action.QUIT:
-                return
-            elif action == Action.MOVE_UP:
-                self._move_selection(-1)
-            elif action == Action.MOVE_DOWN:
-                self._move_selection(1)
-            elif action == Action.PAGE_UP:
-                self._page_move(-1)
-            elif action == Action.PAGE_DOWN:
-                self._page_move(1)
-            elif action == Action.REFRESH:
-                self._refresh_current()
-            elif action == Action.BACK:
-                self._go_back()
-            elif action == Action.ACTIVATE:
-                self._activate_selected()
-            elif action == Action.ENTER_DIR:
-                self._enter_dir_selected()
 
     def _page_size(self) -> int:
         height, _ = self.stdscr.getmaxyx()
@@ -694,10 +736,13 @@ class BrowserApp:
         except KeyboardInterrupt:
             # frame.entries is untouched, so the current (stale) listing stays visible.
             self._set_status(f"已取消刷新 {label}", timeout=2.0)
+            _flush_stale_input()
             return
         except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
             self._set_status(f"刷新失败 {label}：{exc}", timeout=2.0)
+            _flush_stale_input()
             return
+        _flush_stale_input()
         frame.url = final_url
         frame.entries = entries
         self._clamp_viewport()
@@ -789,6 +834,7 @@ class BrowserApp:
         else:
             elapsed = time.monotonic() - start_time
             self._set_status(f"已下载到 {dest_path}（用时 {_format_duration(elapsed)}）", timeout=2.0)
+        _flush_stale_input()
 
     @staticmethod
     def _format_progress(name: str, downloaded: int, total: Optional[int], elapsed: float) -> str:
@@ -805,7 +851,16 @@ class BrowserApp:
         return f"下载中 {name} {format_size(downloaded)} 用时{duration}{_CANCEL_HINT}"
 
     def _confirm_overwrite(self, dest_path: str) -> bool:
-        self._set_status(f"{os.path.basename(dest_path)} 已存在，是否覆盖？(y/n)")
+        basename = os.path.basename(dest_path)
+        # The caller triggers this confirmation when either dest_path or its
+        # ".part" staging file exists -- word the prompt to match which one,
+        # or "movie.mkv 已存在" is misleading when only "movie.mkv.part" is
+        # actually there and movie.mkv itself doesn't exist yet.
+        if os.path.lexists(dest_path):
+            prompt = f"{basename} 已存在，是否覆盖？(y/n)"
+        else:
+            prompt = f"{basename} 的未完成下载（.part）已存在，是否覆盖？(y/n)"
+        self._set_status(prompt)
         try:
             self._draw()
         except KeyboardInterrupt:
