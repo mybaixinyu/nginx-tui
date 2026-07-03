@@ -383,6 +383,38 @@ def _truncate(text: str, max_width: int) -> str:
     return result
 
 
+def _truncate_end(text: str, max_width: int) -> str:
+    """Like _truncate, but keeps the tail of the string instead of the head."""
+    result = ""
+    for ch in reversed(text):
+        if _display_width(ch + result) > max_width:
+            break
+        result = ch + result
+    return result
+
+
+def _truncate_middle(text: str, max_width: int) -> str:
+    # For a path, the head (scheme/host) and the tail (the deepest, most
+    # specific directory) are both more useful than whatever's in between --
+    # cutting from the middle keeps both instead of only ever showing the head.
+    if _display_width(text) <= max_width:
+        return text
+    if max_width <= 1:
+        return _truncate(text, max_width)
+    available = max_width - 1  # reserve 1 column for the ellipsis
+    head_width = (available + 1) // 2
+    tail_width = available - head_width
+    return f"{_truncate(text, head_width)}…{_truncate_end(text, tail_width)}"
+
+
+def _url_label(url: str) -> str:
+    # A short name for status messages ("正在加载 subdir ...") instead of the
+    # full URL, which can be arbitrarily long for deeply nested paths.
+    path = urllib.parse.urlsplit(url).path.rstrip("/")
+    name = urllib.parse.unquote(path.rsplit("/", 1)[-1]) if path else ""
+    return name or urllib.parse.unquote(url)
+
+
 def _ljust(text: str, width: int) -> str:
     return text + " " * max(width - _display_width(text), 0)
 
@@ -463,9 +495,9 @@ class BrowserApp:
             # these pairs falls back to the plain attributes set in __init__.
             pass
 
-    def _load(self, url: str, push: bool) -> bool:
-        display_url = urllib.parse.unquote(url)
-        self._set_status(f"正在加载 {display_url} ...{_CANCEL_HINT}")
+    def _load(self, url: str, push: bool, label: Optional[str] = None) -> bool:
+        display_label = label if label is not None else _url_label(url)
+        self._set_status(f"正在加载 {display_label} ...{_CANCEL_HINT}")
         try:
             self._draw()
             html_text, final_url = fetch_index(url, insecure=self.insecure)
@@ -474,10 +506,10 @@ class BrowserApp:
             # Cancelling a load never pushed a new frame, so the caller is
             # left showing whatever was already on screen (the parent level
             # when entering a subdirectory, or nothing yet at startup).
-            self._set_status(f"已取消加载 {display_url}", timeout=2.0)
+            self._set_status(f"已取消加载 {display_label}", timeout=2.0)
             return False
         except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
-            self._set_status(f"加载失败 {display_url}：{exc}", timeout=2.0)
+            self._set_status(f"加载失败 {display_label}：{exc}", timeout=2.0)
             return False
         if push and self.stack is not None:
             self.stack.push(final_url, entries)
@@ -488,8 +520,15 @@ class BrowserApp:
 
     def run(self) -> None:
         while True:
-            self._draw()
-            key = self.stdscr.getch()
+            try:
+                self._draw()
+                key = self.stdscr.getch()
+            except KeyboardInterrupt:
+                # Idle browsing has no in-flight operation for Ctrl-C to
+                # cancel (unlike load/refresh/download/confirm, which each
+                # handle it themselves) -- ignore it rather than letting it
+                # fall through to main()'s handler and kill the whole TUI.
+                continue
             if key == -1:
                 continue
             if key == curses.KEY_RESIZE:
@@ -588,18 +627,18 @@ class BrowserApp:
 
     def _refresh_current(self) -> None:
         frame = self.stack.current
-        display_url = urllib.parse.unquote(frame.url)
-        self._set_status(f"正在刷新 {display_url} ...{_CANCEL_HINT}")
+        label = _url_label(frame.url)
+        self._set_status(f"正在刷新 {label} ...{_CANCEL_HINT}")
         try:
             self._draw()
             html_text, final_url = fetch_index(frame.url, insecure=self.insecure)
             entries = parse_index(html_text, final_url)
         except KeyboardInterrupt:
             # frame.entries is untouched, so the current (stale) listing stays visible.
-            self._set_status(f"已取消刷新 {display_url}", timeout=2.0)
+            self._set_status(f"已取消刷新 {label}", timeout=2.0)
             return
         except (urllib.error.URLError, OSError, ValueError, LookupError, http.client.HTTPException) as exc:
-            self._set_status(f"刷新失败 {display_url}：{exc}", timeout=2.0)
+            self._set_status(f"刷新失败 {label}：{exc}", timeout=2.0)
             return
         frame.url = final_url
         frame.entries = entries
@@ -628,7 +667,7 @@ class BrowserApp:
             return
         entry = frame.entries[frame.selected]
         if entry.is_dir:
-            self._load(entry.url, push=True)
+            self._load(entry.url, push=True, label=entry.name)
         else:
             self._download(entry)
 
@@ -638,7 +677,7 @@ class BrowserApp:
             return
         entry = frame.entries[frame.selected]
         if entry.is_dir:
-            self._load(entry.url, push=True)
+            self._load(entry.url, push=True, label=entry.name)
 
     def _download(self, entry: Entry) -> None:
         # basename() guards against path traversal via a crafted href
@@ -750,7 +789,7 @@ class BrowserApp:
             return
 
         frame = self.stack.current
-        breadcrumb = _truncate(urllib.parse.unquote(frame.url), width - 1)
+        breadcrumb = _truncate_middle(urllib.parse.unquote(frame.url), width - 1)
         self.stdscr.addstr(0, 0, breadcrumb, self.header_attr)
 
         size_width, mtime_width = 8, 16
@@ -781,7 +820,10 @@ class BrowserApp:
         self.stdscr.refresh()
 
     def _draw_center_message(self, height: int, width: int, text: str) -> None:
-        text = _truncate(text, max(width - 4, 0))
+        # Middle-truncate rather than cut the tail off: a long embedded file
+        # or directory name would otherwise push a trailing "(y/n)" prompt,
+        # cancel hint, or download percentage off the edge of the screen.
+        text = _truncate_middle(text, max(width - 4, 0))
         if not text:
             return
         line = f" {text} "

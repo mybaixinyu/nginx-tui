@@ -23,6 +23,8 @@ from nginx_tui import (
     _format_duration,
     _format_entry_size,
     _ssl_context,
+    _truncate_middle,
+    _url_label,
     download_file,
     fetch_index,
     format_mtime,
@@ -517,6 +519,18 @@ class TestRefreshCurrent(unittest.TestCase):
         self.assertEqual(app.stack.current.entries, initial_entries)
         self.assertIn("已取消刷新", app.status)
 
+    def test_status_shows_directory_name_not_the_full_url(self):
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/a/b/c/very-long-directory-name/", "/tmp")
+            with unittest.mock.patch("nginx_tui.fetch_index", side_effect=KeyboardInterrupt):
+                app._refresh_current()
+        self.assertIn("very-long-directory-name", app.status)
+        self.assertNotIn("http://x/a/b/c", app.status)
+
 
 class TestLoadCancellation(unittest.TestCase):
     def test_keyboard_interrupt_while_entering_a_subdirectory_stays_at_parent(self):
@@ -544,6 +558,23 @@ class TestLoadCancellation(unittest.TestCase):
             app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")  # must not raise
         self.assertIsNone(app.stack)
         self.assertIn("已取消加载", app.status)
+
+    def test_entering_a_directory_shows_its_name_not_the_full_url(self):
+        entries = [Entry(
+            "subdir/", "subdir/", "http://x/a/b/c/d/e/f/g/h/subdir/", True, None, None,
+        )]
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=entries):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            app.stack.current.entries = entries
+            app.stack.current.selected = 0
+            with unittest.mock.patch("nginx_tui.fetch_index", side_effect=KeyboardInterrupt):
+                app._enter_dir_selected()
+        self.assertIn("subdir/", app.status)
+        self.assertNotIn("http://x/a/b/c/d/e/f/g/h", app.status)
 
 
 class TestFormatDuration(unittest.TestCase):
@@ -809,6 +840,32 @@ class TestBreadcrumbDisplay(unittest.TestCase):
         init_pair_mock.assert_any_call(3, curses.COLOR_CYAN, -1)
         self.assertEqual(app.footer_attr, 300 | curses.A_BOLD)
 
+    def test_breadcrumb_truncates_in_the_middle_when_too_narrow(self):
+        class _RecordingStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = []
+
+            def getmaxyx(self):
+                return (24, 30)
+
+            def addstr(self, *args, **kwargs):
+                self.calls.append(args)
+
+        long_url = "http://x/" + "dir/" * 10 + "leaf-directory/"
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_RecordingStdScr(), long_url, "/tmp")
+            app.stdscr.calls.clear()
+            app._draw()
+        shown = app.stdscr.calls[0][2]
+        self.assertLessEqual(_display_width(shown), 29)
+        self.assertIn("…", shown)
+        self.assertTrue(shown.startswith("http://x/"))
+        self.assertTrue(shown.endswith("directory/"))
+
     def test_footer_line_no_longer_uses_dim_attribute(self):
         class _RecordingStdScr(_FakeStdScr):
             def __init__(self):
@@ -842,6 +899,33 @@ class TestDrawResilience(unittest.TestCase):
             unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
             app = BrowserApp(_FailingStdScr(), "http://x/", "/tmp")
             app._draw()  # must not raise curses.error
+
+
+class TestDrawCenterMessage(unittest.TestCase):
+    def test_long_name_status_keeps_trailing_prompt_visible(self):
+        class _RecordingStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = []
+
+            def getmaxyx(self):
+                return (24, 40)
+
+            def addstr(self, *args, **kwargs):
+                self.calls.append(args)
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_RecordingStdScr(), "http://x/", "/tmp")
+            long_name = "a-very-long-file-name-that-does-not-fit-on-one-line.tar.gz"
+            app._set_status(f"{long_name} 已存在，是否覆盖？(y/n)")
+            app.stdscr.calls.clear()
+            app._draw()
+        center_call = next(c for c in app.stdscr.calls if "y/n" in c[2])
+        self.assertIn("…", center_call[2])
+        self.assertTrue(center_call[2].rstrip().endswith("(y/n)"))
 
 
 def _make_app_with_entries(count):
@@ -925,6 +1009,64 @@ class TestResizeAdjustsOffset(unittest.TestCase):
             with unittest.mock.patch.object(app, "_adjust_offset") as adjust_mock:
                 app.run()
         adjust_mock.assert_called_once()
+
+
+class TestRunLoopIgnoresIdleCtrlC(unittest.TestCase):
+    def test_keyboard_interrupt_while_idle_browsing_does_not_exit(self):
+        class _InterruptThenQuitStdScr(_FakeStdScr):
+            def __init__(self):
+                self.calls = 0
+
+            def getch(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise KeyboardInterrupt
+                return ord("q")
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+            app.stdscr = _InterruptThenQuitStdScr()
+            app.run()  # must not raise / propagate KeyboardInterrupt
+        self.assertEqual(app.stdscr.calls, 2)
+
+
+class TestTruncateMiddle(unittest.TestCase):
+    def test_short_text_is_unchanged(self):
+        self.assertEqual(_truncate_middle("short", 20), "short")
+
+    def test_text_exactly_at_width_is_unchanged(self):
+        self.assertEqual(_truncate_middle("12345", 5), "12345")
+
+    def test_long_text_keeps_head_and_tail(self):
+        text = "A" * 10 + "MIDDLE" + "B" * 10
+        result = _truncate_middle(text, 12)
+        self.assertEqual(_display_width(result), 12)
+        self.assertTrue(result.startswith("AAAAAA"))
+        self.assertTrue(result.endswith("BBBBB"))
+        self.assertIn("…", result)
+        self.assertNotIn("MIDDLE", result)
+
+    def test_extremely_small_width_falls_back_to_head_truncate(self):
+        self.assertEqual(_truncate_middle("hello", 1), "h")
+        self.assertEqual(_truncate_middle("hello", 0), "")
+
+
+class TestUrlLabel(unittest.TestCase):
+    def test_returns_leaf_directory_name(self):
+        self.assertEqual(_url_label("http://x/a/b/subdir/"), "subdir")
+
+    def test_returns_leaf_file_name(self):
+        self.assertEqual(_url_label("http://x/a/b/file.txt"), "file.txt")
+
+    def test_percent_decodes_the_leaf(self):
+        self.assertEqual(_url_label("http://x/%E4%B8%AD%E6%96%87/"), "中文")
+
+    def test_root_url_falls_back_to_full_url(self):
+        self.assertEqual(_url_label("http://x/"), "http://x/")
 
 
 class TestMain(unittest.TestCase):
