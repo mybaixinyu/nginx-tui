@@ -546,6 +546,12 @@ class BrowserApp:
             pass
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS)
+            # Default is 200ms: ncurses holds a button-press event that long
+            # waiting to see if a matching release arrives to synthesize
+            # BUTTON1_CLICKED, which reads as a perceptible click-to-download
+            # lag. _handle_mouse already treats BUTTON1_PRESSED alone as a
+            # trigger, so there's nothing to wait for.
+            curses.mouseinterval(0)
         except curses.error:
             pass
         self.stdscr.keypad(True)
@@ -835,7 +841,14 @@ class BrowserApp:
             self._set_status(self._format_progress(entry.name, downloaded, total, elapsed), timeout=1.0)
             self._draw()
 
+        # download_file() doesn't report anything until the first byte
+        # actually arrives (on_progress), so without this, the entire
+        # connect/TLS/request-response-headers phase is silent -- on a slow
+        # or distant server that's a genuine multi-hundred-ms gap with zero
+        # feedback, indistinguishable from the keypress not registering.
+        self._set_status(f"正在下载 {entry.name} ...{_CANCEL_HINT}")
         try:
+            self._draw()
             download_file(entry.url, dest_path, progress_cb=on_progress, insecure=self.insecure)
         except KeyboardInterrupt:
             self._set_status("下载已中断", timeout=1.5)

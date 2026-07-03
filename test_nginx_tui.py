@@ -1044,6 +1044,33 @@ class TestDownloadOverwriteCheck(unittest.TestCase):
         download_mock.assert_not_called()
 
 
+class TestDownloadStatusFeedback(unittest.TestCase):
+    def test_shows_a_status_message_before_the_network_call_starts(self):
+        # download_file() doesn't report anything until the first byte
+        # arrives via on_progress -- without an upfront status, a slow
+        # connect/TLS/request-headers phase looks identical to the keypress
+        # not having registered at all.
+        entries = [Entry("movie.mkv", "movie.mkv", "http://x/movie.mkv", False, 100, None)]
+        output_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, output_dir, ignore_errors=True)
+        status_when_called = []
+
+        def fake_download_file(url, dest_path, progress_cb=None, **kwargs):
+            status_when_called.append(app.status)
+
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=entries), \
+            unittest.mock.patch("nginx_tui.download_file", side_effect=fake_download_file):
+            app = BrowserApp(_FakeStdScr(), "http://x/", output_dir)
+            app._activate_selected()
+
+        self.assertEqual(len(status_when_called), 1)
+        self.assertIn("正在下载 movie.mkv", status_when_called[0])
+
+
 class TestBreadcrumbDisplay(unittest.TestCase):
     def test_breadcrumb_shows_percent_decoded_url(self):
         class _RecordingStdScr(_FakeStdScr):
@@ -1438,6 +1465,23 @@ class TestSmallTerminalMessage(unittest.TestCase):
             app._draw()
         self.assertEqual(len(app.stdscr.calls), 1)
         self.assertIn("窗口太小，按 q 退出", app.stdscr.calls[0][2])
+
+
+class TestMouseInterval(unittest.TestCase):
+    def test_mouseinterval_is_disabled_at_init(self):
+        # ncurses' default mouseinterval (200ms) makes it hold a button-press
+        # event that long waiting for a possible release to pair it with
+        # into a BUTTON1_CLICKED -- since _handle_mouse already reacts to a
+        # bare BUTTON1_PRESSED, that wait is a pure, perceptible click-to-
+        # download lag with nothing gained from it.
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.mouseinterval") as mouseinterval_mock, \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            BrowserApp(_FakeStdScr(), "http://x/", "/tmp")
+        mouseinterval_mock.assert_called_once_with(0)
 
 
 class TestHandleMouseTooSmall(unittest.TestCase):
