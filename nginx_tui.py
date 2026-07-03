@@ -487,6 +487,16 @@ def _url_label(url: str) -> str:
     return _sanitize_display_text(name or urllib.parse.unquote(url))
 
 
+def _dir_label(url: str) -> str:
+    # Every caller of this (the startup load and refresh) only ever passes a
+    # directory URL -- _url_label() itself strips the trailing slash to find
+    # the leaf path segment (it's also used for plain file leaf names, which
+    # shouldn't gain one), so restore it here to match how a directory Entry's
+    # own name (unquote(href), trailing "/" intact) is shown when entering it.
+    label = _url_label(url)
+    return label if label.endswith("/") else label + "/"
+
+
 def _ljust(text: str, width: int) -> str:
     return text + " " * max(width - _display_width(text), 0)
 
@@ -587,7 +597,7 @@ class BrowserApp:
             pass
 
     def _load(self, url: str, push: bool, label: Optional[str] = None) -> bool:
-        display_label = label if label is not None else _url_label(url)
+        display_label = label if label is not None else _dir_label(url)
         self._set_status(f"正在加载 {display_label} ...{_CANCEL_HINT}")
         try:
             self._draw()
@@ -727,7 +737,7 @@ class BrowserApp:
 
     def _refresh_current(self) -> None:
         frame = self.stack.current
-        label = _url_label(frame.url)
+        label = _dir_label(frame.url)
         self._set_status(f"正在刷新 {label} ...{_CANCEL_HINT}")
         try:
             self._draw()

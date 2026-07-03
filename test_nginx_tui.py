@@ -19,6 +19,7 @@ from nginx_tui import (
     BrowserApp,
     Entry,
     NavigationStack,
+    _dir_label,
     _display_width,
     _flush_stale_input,
     _format_duration,
@@ -680,6 +681,21 @@ class TestRefreshCurrent(unittest.TestCase):
         self.assertIn("very-long-directory-name", app.status)
         self.assertNotIn("http://x/a/b/c", app.status)
 
+    def test_directory_label_keeps_trailing_slash_like_entering_it_does(self):
+        # Entering a directory takes its label from the Entry's own name
+        # (trailing "/" intact); refreshing used to take it from _url_label()
+        # instead, which strips the slash -- same directory, two different
+        # looking status messages ("正在加载 subdir/" vs "正在刷新 subdir").
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=lambda url, **k: ("<html></html>", url)), \
+            unittest.mock.patch("nginx_tui.parse_index", return_value=[]):
+            app = BrowserApp(_FakeStdScr(), "http://x/subdir/", "/tmp")
+            with unittest.mock.patch("nginx_tui.fetch_index", side_effect=KeyboardInterrupt):
+                app._refresh_current()
+        self.assertIn("subdir/", app.status)
+
 
 class TestLoadCancellation(unittest.TestCase):
     def test_keyboard_interrupt_while_entering_a_subdirectory_stays_at_parent(self):
@@ -711,6 +727,17 @@ class TestLoadCancellation(unittest.TestCase):
         self.assertIsNone(app.stack)
         self.assertIn("已取消加载", app.status)
         self.assertTrue(app.startup_cancelled)
+
+    def test_startup_load_label_keeps_trailing_slash(self):
+        # The startup load has no Entry to take a label from, so it falls
+        # back to _dir_label(url) -- must match how entering a subdirectory
+        # from within the app labels it (trailing "/" intact).
+        with unittest.mock.patch("nginx_tui.curses.curs_set"), \
+            unittest.mock.patch("nginx_tui.curses.mousemask"), \
+            unittest.mock.patch("nginx_tui.curses.has_colors", return_value=False), \
+            unittest.mock.patch("nginx_tui.fetch_index", side_effect=KeyboardInterrupt):
+            app = BrowserApp(_FakeStdScr(), "http://x/a/subdir/", "/tmp")  # must not raise
+        self.assertIn("subdir/", app.status)
 
     def test_entering_a_directory_shows_its_name_not_the_full_url(self):
         entries = [Entry(
@@ -1654,6 +1681,22 @@ class TestUrlLabel(unittest.TestCase):
     def test_sanitizes_control_characters(self):
         self.assertNotIn("\n", _url_label("http://x/evil%0Aname/"))
         self.assertIn("evil", _url_label("http://x/evil%0Aname/"))
+
+
+class TestDirLabel(unittest.TestCase):
+    def test_restores_the_trailing_slash_url_label_strips(self):
+        # _load's "正在加载 subdir/ ..." (label taken from a directory
+        # Entry's own name, which keeps its trailing "/") and
+        # _refresh_current's "正在刷新 subdir ..." (label from _url_label,
+        # which strips it to find the leaf segment) used to disagree for the
+        # very same directory -- _dir_label makes both show "subdir/".
+        self.assertEqual(_dir_label("http://x/a/b/subdir/"), "subdir/")
+
+    def test_root_url_is_not_given_a_second_trailing_slash(self):
+        self.assertEqual(_dir_label("http://x/"), "http://x/")
+
+    def test_percent_decodes_the_leaf(self):
+        self.assertEqual(_dir_label("http://x/%E4%B8%AD%E6%96%87/"), "中文/")
 
 
 class TestMain(unittest.TestCase):
