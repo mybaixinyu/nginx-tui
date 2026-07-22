@@ -21,7 +21,10 @@ from typing import Callable, Dict, List, Optional, Tuple
 CHUNK_SIZE = 65536
 CONNECT_TIMEOUT = 15.0
 PROGRESS_THROTTLE_SECONDS = 0.1
-_USER_AGENT = "nginx-tui/1.0"
+# Impersonate curl: some network firewalls block unfamiliar User-Agent
+# strings, and a bare autoindex fetch is exactly what curl is used for, so
+# curl's UA sails through where "nginx-tui/1.0" gets dropped.
+_USER_AGENT = "curl/8.7.1"
 _CANCEL_HINT = "（Ctrl-C 取消）"
 # A directory listing page is plain text with light markup -- even a huge
 # directory stays well under this. Bounds how much a URL that turns out to
