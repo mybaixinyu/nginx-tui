@@ -380,6 +380,54 @@ class TestFetchIndex(_ServerTestCase):
         self.assertEqual(html_text, "<html>ok</html>")
 
 
+class _HeaderRecordingHandler(http.server.BaseHTTPRequestHandler):
+    last_headers = None
+
+    def do_GET(self):
+        type(self).last_headers = dict(self.headers)
+        body = b"<html>ok</html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+class TestRequestHeaders(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _HeaderRecordingHandler)
+        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.server_thread.start()
+        cls.base_url = f"http://127.0.0.1:{cls.server.server_port}/"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def test_fetch_index_sends_curl_user_agent_and_accept(self):
+        _HeaderRecordingHandler.last_headers = None
+        fetch_index(self.base_url + "page.html")
+        headers = _HeaderRecordingHandler.last_headers
+        # A network firewall that fingerprints curl expects both a curl
+        # User-Agent and curl's "Accept: */*"; urllib omits Accept by default.
+        self.assertEqual(headers.get("User-Agent"), "curl/8.7.1")
+        self.assertEqual(headers.get("Accept"), "*/*")
+
+    def test_download_file_sends_curl_user_agent_and_accept(self):
+        dest_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, dest_dir, ignore_errors=True)
+        _HeaderRecordingHandler.last_headers = None
+        download_file(self.base_url + "file.bin", os.path.join(dest_dir, "file.bin"))
+        headers = _HeaderRecordingHandler.last_headers
+        self.assertEqual(headers.get("User-Agent"), "curl/8.7.1")
+        self.assertEqual(headers.get("Accept"), "*/*")
+
+
 class TestDownloadFile(_ServerTestCase):
     def setUp(self):
         self.dest_dir = tempfile.mkdtemp()

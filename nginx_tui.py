@@ -21,10 +21,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 CHUNK_SIZE = 65536
 CONNECT_TIMEOUT = 15.0
 PROGRESS_THROTTLE_SECONDS = 0.1
-# Impersonate curl: some network firewalls block unfamiliar User-Agent
-# strings, and a bare autoindex fetch is exactly what curl is used for, so
-# curl's UA sails through where "nginx-tui/1.0" gets dropped.
+# Impersonate curl: some network firewalls block unfamiliar clients, and a
+# bare autoindex fetch is exactly what curl is used for, so curl's request
+# sails through where a custom client gets dropped. Matching only the
+# User-Agent isn't enough -- such firewalls also key on curl's "Accept: */*",
+# which urllib omits by default -- so send curl's header set as a unit.
 _USER_AGENT = "curl/8.7.1"
+_REQUEST_HEADERS = {"User-Agent": _USER_AGENT, "Accept": "*/*"}
 _CANCEL_HINT = "（Ctrl-C 取消）"
 # A directory listing page is plain text with light markup -- even a huge
 # directory stays well under this. Bounds how much a URL that turns out to
@@ -269,7 +272,7 @@ def fetch_index(url: str, timeout: float = CONNECT_TIMEOUT, insecure: bool = Fal
     # Returns (html, final_url): nginx 301-redirects a directory request that's
     # missing its trailing slash, and relative hrefs in the listing must be
     # resolved against that final URL, not the one originally requested.
-    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    request = urllib.request.Request(url, headers=_REQUEST_HEADERS)
     with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context(insecure)) as response:
         charset = response.headers.get_content_charset() or "utf-8"
         chunks = []
@@ -296,7 +299,7 @@ def download_file(
     insecure: bool = False,
 ) -> None:
     part_path = dest_path + ".part"
-    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    request = urllib.request.Request(url, headers=_REQUEST_HEADERS)
     opened_part = False
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context(insecure)) as response:
